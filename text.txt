@@ -1,18 +1,18 @@
-Subject: Thank you for everything
+Subject: Thanks for everything
 
-Dear [Name],
+Dear “Name”,
 
-I hope this email finds you well.
+I hope you are well with this email.
 
-As I wrap up my time here, I wanted to take a moment to sincerely thank you for everything you've done for me.
+I just wanted to take a moment to say thank you for all you’ve done for me as I wrap up here.
 
-When I joined this project, I was completely new to S/4HANA, and you patiently guided me through every step. You answered all my doubts, no matter how basic, and trusted me with objects even when I was still learning. That trust and confidence meant a lot to me.
+I was new to S/4HANA when I joined this project and you helped me through every step with patience. You answered all my doubts, however elementary, and trusted me with objects even when I was still learning. That trust and confidence meant a lot to me.
 
-Beyond the technical knowledge, I've also learned a great deal from watching how you work and the kind of person you are. There's so much to learn from you, and I'm truly grateful for the time I got to work under your guidance.
+I have learned a lot by watching how you work and what kind of person you are, besides technical knowledge. You have so much to teach me, and I’m so grateful for all of the time I had to work under your tutelage.
 
-Thank you for being such a supportive manager. I'll always carry forward what you've taught me.
+Thanks for being such a supportive boss I will always remember what you have taught me.
 
-Wishing you all the very best.
+I wish you all the best for you.
 
-Warm regards,
-[Your Full Name]
+Best wishes,
+[Full Name]
