@@ -1,1458 +1,99 @@
-; =============================================================================
-; Close All Windows - Window Manager & End-of-Session Utility
-; =============================================================================
-; A GUI utility to selectively close windows with advanced filtering
-; and post-close power actions.
-;
-; Features:
-;   - Window list with search/filter and process grouping
-;   - Select individual, all, or by process name
-;   - Graceful close with force-kill escalation
-;   - Post-close power actions (Shutdown/Restart/Sleep/Hibernate/Lock)
-;   - Countdown dialog before power action with cancel or immediate execute
-;   - Process-level kill for hung applications
-;   - Pinned processes (never close), persisted to config
-;   - Quick profiles (End of Day, Focus Mode, Meeting Mode, custom)
-;   - Auto-refresh every 5 seconds with countdown
-;   - Toggle detail columns (Class, PID) via menu
-;   - Right-click: Switch To, Close, Kill Process, Pin, Keep Only
-;
-; Hotkeys:
-;   Win+Esc           Open window selector GUI
-;   Win+Shift+Esc     Force-close all windows + power action prompt
-;
-; Config: closeall_config.ini (auto-created in script directory)
-; =============================================================================
-
-#Requires AutoHotkey v2.0
-#SingleInstance Force
-
-Persistent
-SetTitleMatchMode 2
-SendMode "Input"
-#NoTrayIcon
-
-global APP_NAME := "Close All Windows"
-global CONFIG_FILE := A_ScriptDir "\closeall_config.ini"
-
-; ── Configuration ─────────────────────────────────────────
-/**
- * Configuration options and global exclusions for the window manager.
- */
-class Config {
-    static ExcludedClasses := [
-        "Progman", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
-        "WorkerW", "DV2ControlHost", "Windows.UI.Core.CoreWindow",
-        "MultitaskingViewFrame", "ForegroundStaging", "TApplication",
-        "SysListView32", "EdgeUiInputTopWndClass"
-    ]
-    static ExcludedTitles := ["Program Manager", "Settings", "Microsoft Text Input Application"]
-    static PowerActions := ["Nothing", "Shutdown", "Restart", "Sleep", "Hibernate", "Lock Screen"]
-}
-
-; ── Initialization ────────────────────────────────────────
-App := WindowManagerApp()
-
-; ── Hotkeys ───────────────────────────────────────────────
-#Esc:: App.ShowWindowSelector()
-#+Esc:: App.ForceCloseAllAndAction()
-
-; ── Cleanup ───────────────────────────────────────────────
-OnExit((*) => (App.CloseGui(), App.CancelCountdown()))
-
-
-; =============================================================================
-; APPLICATION CLASS
-; =============================================================================
-
-/**
- * Main application class that coordinates the GUI, window filtering,
- * process actions, profiles, and post-close power actions.
- */
-class WindowManagerApp {
-    /**
-     * Initializes application state, sets up bound timers, and loads saved configurations.
-     */
-    __New() {
-        this.State := {
-            guiObj: false,
-            listView: "",
-            statusText: "",
-            searchBox: "",
-            powerActionDDL: "",
-            autoExecuteChk: "",
-            windowData: Map(),
-            allWindowData: [],
-            showDetails: true,
-            refreshCountdown: 5,
-            ; Status expiration timestamp
-            statusExpires: 0,
-            ; Power action settings (persisted to INI)
-            defaultPowerAction: 2,
-            autoExecute: false,
-            countdownSeconds: 10,
-            ; Countdown dialog state
-            countdownGui: false,
-            countdownRemaining: 0,
-            countdownAction: "",
-            countdownProgressCtrl: "",
-            countdownTextCtrl: "",
-            ; Pinned processes (persisted to INI)
-            pinnedProcesses: [],
-            ; Profiles (persisted to INI)
-            profiles: [],
-            ; Process submenu object
-            processMenu: false
-        }
-
-        ; Store BoundFunc references once to prevent timer leaks
-        this.CountdownTickFn := ObjBindMethod(this, "CountdownTick")
-        this.CountdownDialogTickFn := ObjBindMethod(this, "CountdownDialogTick")
-        this.ResetStatusFn := ObjBindMethod(this, "ResetStatus")
-
-        ; Load saved settings
-        this.LoadSettings()
-    }
-
-    ; =========================================================================
-    ; GUI CONSTRUCTION
-    ; =========================================================================
-
-    ShowWindowSelector() {
-        ; If already open, just focus it
-        if this.State.guiObj {
-            try this.State.guiObj.Show()
-            return
-        }
-
-        this.State.guiObj := Gui("+AlwaysOnTop", APP_NAME)
-        this.SetModernFont(this.State.guiObj)
-        this.State.guiObj.OnEvent("Close", this.OnGuiClose.Bind(this))
-
-        ; ── Menu Bar ──────────────────────────────────
-        ActionMenu := Menu()
-        ActionMenu.Add("&Close Selected`tEnter", (*) => this.CloseSelectedWindows(false))
-        ActionMenu.Add("&Force Close Selected", (*) => this.CloseSelectedWindows(true))
-        ActionMenu.Add()  ; Separator
-        ActionMenu.Add("Force Close &All (No GUI)", (*) => this.ForceCloseAllAndAction())
-        ActionMenu.Add()
-        ActionMenu.Add("E&xit", (*) => ExitApp())
-
-        SelectMenu := Menu()
-        SelectMenu.Add("Select &All`tCtrl+A", (*) => this.SelectAllWindows(true))
-        SelectMenu.Add("Select &None", (*) => this.SelectAllWindows(false))
-        SelectMenu.Add()  ; Separator
-        this.State.processMenu := this.BuildProcessSubMenu()
-        SelectMenu.Add("Select by &Process", this.State.processMenu)
-
-        ViewMenu := Menu()
-        ViewMenu.Add("&Details (Class, PID)", this.ToggleDetailsMenu.Bind(this))
-        if this.State.showDetails
-            ViewMenu.Check("&Details (Class, PID)")
-        ViewMenu.Add("&Refresh Now`tF5", (*) => this.RefreshWindowList())
-
-        Menus := MenuBar()
-        Menus.Add("&Action", ActionMenu)
-        Menus.Add("&Select", SelectMenu)
-        Menus.Add("&Profiles", this.BuildProfilesMenu())
-        Menus.Add("&View", ViewMenu)
-        this.State.guiObj.MenuBar := Menus
-
-        ; ── Search Row ────────────────────────────────
-        this.State.guiObj.AddText("w50 h23 +0x200 Section", "Search:")
-        this.State.searchBox := this.State.guiObj.AddEdit("x+5 yp w200")
-        this.State.searchBox.OnEvent("Change", (*) => this.ApplyFilter())
-
-        this.State.guiObj.AddButton("x+10 yp w72 h23", "&Refresh").OnEvent("Click", (*) => this.RefreshWindowList())
-
-        ; ── Window ListView ───────────────────────────
-        this.State.listView := this.State.guiObj.AddListView(
-            "xs w520 h200 Checked Grid Section",
-            ["PROCESS", "WINDOW TITLE", "CLASS", "PID"])
-
-        this.State.listView.ModifyCol(1, 100)
-        this.State.listView.ModifyCol(2, 260)
-        this.State.listView.ModifyCol(3, this.State.showDetails ? 120 : 0)
-        this.State.listView.ModifyCol(4, this.State.showDetails ? 40 : 0)
-
-        this.State.listView.OnEvent("Click", this.ToggleRowCheckbox.Bind(this))
-        this.State.listView.OnEvent("ContextMenu", this.OnListViewContextMenu.Bind(this))
-
-        ; ── Action Buttons ────────────────────────────
-        ; 520px container, 4 buttons, 5px gaps: (520 - 15) / 4 = 126
-        btnClose := this.State.guiObj.AddButton("xs w126 h23 Default", "&Close")
-        btnClose.OnEvent("Click", (*) => this.CloseSelectedWindows(false))
-
-        btnForceClose := this.State.guiObj.AddButton("x+5 yp w126 h23", "&Force Close")
-        btnForceClose.OnEvent("Click", (*) => this.CloseSelectedWindows(true))
-
-        btnSelectAll := this.State.guiObj.AddButton("x+5 yp w126 h23", "Select A&ll")
-        btnSelectAll.OnEvent("Click", (*) => this.SelectAllWindows(true))
-
-        btnSelectNone := this.State.guiObj.AddButton("x+5 yp w126 h23", "Select &None")
-        btnSelectNone.OnEvent("Click", (*) => this.SelectAllWindows(false))
-
-        ; ── Power Action Row ──────────────────────────
-        this.State.guiObj.AddText("xs w70 h23 +0x200", "After close:")
-        this.State.powerActionDDL := this.State.guiObj.AddDropDownList(
-            "x+5 yp w150 Choose" this.State.defaultPowerAction, Config.PowerActions)
-        this.State.powerActionDDL.OnEvent("Change", (*) => this.OnPowerActionChange())
-
-        this.State.autoExecuteChk := this.State.guiObj.AddCheckbox(
-            "x+10 yp h23 Checked" this.State.autoExecute, "Quick countdown (3s)")
-        this.State.autoExecuteChk.OnEvent("Click", (*) => this.OnAutoExecuteChange())
-
-        ; ── Status Bar ────────────────────────────────
-        this.State.statusText := this.State.guiObj.AddText("xs w520 h20", "Ready")
-
-        ; ── GUI-Scoped Hotkeys ────────────────────────
-        HotIfWinActive("ahk_id " this.State.guiObj.Hwnd)
-        Hotkey("Escape", (*) => this.CloseGui())
-        Hotkey("^a", (*) => this.SelectAllWindows(true))
-        Hotkey("F5", (*) => this.RefreshWindowList())
-        Hotkey("Enter", (*) => this.CloseSelectedWindows(false))
-        Hotkey("^Enter", (*) => this.CloseSelectedWindows(true))
-        Hotkey("Delete", (*) => this.CloseFocusedWindow())
-        Hotkey("^f", (*) => this.FocusSearch())
-        HotIfWinActive()
-
-        ; ── Populate & Start Timer ────────────────────
-        this.RefreshWindowList()
-        SetTimer(this.CountdownTickFn, 1000)
-
-        this.State.guiObj.Show("AutoSize")
-    }
-
-    ; =========================================================================
-    ; GUI LIFECYCLE
-    ; =========================================================================
-
-    OnGuiClose(*) {
-        this.CloseGui()
-    }
-
-    CloseGui() {
-        SetTimer(this.CountdownTickFn, 0)  ; Stop countdown
-
-        ; Remove GUI-scoped hotkeys
-        if this.State.guiObj {
-            try {
-                HotIfWinActive("ahk_id " this.State.guiObj.Hwnd)
-                Hotkey("Escape", "Off")
-                Hotkey("^a", "Off")
-                Hotkey("F5", "Off")
-                Hotkey("Enter", "Off")
-                Hotkey("^Enter", "Off")
-                Hotkey("Delete", "Off")
-                Hotkey("^f", "Off")
-                HotIfWinActive()
-            }
-            try this.State.guiObj.Destroy()
-        }
-
-        this.State.guiObj := false
-        this.State.windowData := Map()
-        this.State.allWindowData := []
-    }
-
-    ; =========================================================================
-    ; UI HELPERS
-    ; =========================================================================
-
-    SetModernFont(guiObj, size := 9) {
-        try guiObj.SetFont("s" size, "Segoe UI Variable")
-        catch
-            guiObj.SetFont("s" size, "Segoe UI")
-    }
-
-    /**
-     * Periodic timer tick (every 1s) to handle the auto-refresh countdown.
-     * Prevents status updates if a temporary message is currently showing.
-     */
-    CountdownTick() {
-        if !this.State.guiObj
-            return
-
-        try {
-            this.State.refreshCountdown--
-
-            if (this.State.refreshCountdown <= 0) {
-                this.RefreshWindowList()
-                this.State.refreshCountdown := 5
-            } else {
-                ; Only overwrite the status bar if no temporary feedback is showing
-                if (A_TickCount >= this.State.statusExpires)
-                    this.UpdateStatus()
-            }
-        }
-    }
-
-    UpdateStatus() {
-        try {
-            total := this.State.listView.GetCount()
-            selected := this.GetCheckedCount()
-            this.State.statusText.SetFont("c000000")
-            this.State.statusText.Text := selected " of " total " selected | Refresh in " this.State.refreshCountdown "s"
-        }
-    }
-
-    /**
-     * Displays a temporary success or error message in the status bar.
-     * @param {String} msg The message text to display.
-     * @param {Boolean} isError Whether this is an error message (colored red).
-     */
-    SetStatus(msg, isError := false) {
-        try {
-            this.State.statusText.SetFont(isError ? "cFF0000" : "c008800")
-            this.State.statusText.Text := msg
-            this.State.statusExpires := A_TickCount + 2000
-            SetTimer(this.ResetStatusFn, -2000)
-        }
-    }
-
-    /**
-     * Resets the temporary status message and restores the default countdown status.
-     */
-    ResetStatus() {
-        this.State.statusExpires := 0
-        this.UpdateStatus()
-    }
-
-    ; =========================================================================
-    ; LISTVIEW MANAGEMENT
-    ; =========================================================================
-
-    GetCheckedCount() {
-        count := 0
-        row := 0
-        Loop {
-            row := this.State.listView.GetNext(row, "Checked")
-            if !row
-                break
-            count++
-        }
-        return count
-    }
-
-    /**
-     * Refreshes the list of active windows, matching search filters and preserving checkboxes.
-     */
-    RefreshWindowList() {
-        if !this.State.guiObj
-            return
-
-        ; Save currently checked window IDs before refresh
-        checkedIDs := Map()
-        row := 0
-        Loop {
-            row := this.State.listView.GetNext(row, "Checked")
-            if !row
-                break
-            if this.State.windowData.Has(row)
-                checkedIDs[this.State.windowData[row]] := true
-        }
-
-        ; Rebuild
-        this.State.listView.Delete()
-        this.State.windowData := Map()
-        this.State.allWindowData := []
-
-        filter := ""
-        try filter := this.State.searchBox.Value
-
-        for windowID in WinGetList() {
-            if !IsWindowCloseable(windowID, this.State.guiObj ? this.State.guiObj.Hwnd : 0)
-                continue
-
-            try {
-                title := WinGetTitle("ahk_id " windowID)
-                classWin := WinGetClass("ahk_id " windowID)
-                pid := WinGetPID("ahk_id " windowID)
-                processName := WinGetProcessName("ahk_id " windowID)
-
-                displayTitle := StrLen(title) > 60 ? SubStr(title, 1, 57) "..." : title
-
-                ; Check if this process is pinned (never close)
-                isPinned := this.IsPinned(processName)
-                if isPinned
-                    displayTitle .= " (pinned)"
-
-                ; Pinned windows default unchecked; others default checked on first load
-                if isPinned
-                    isChecked := checkedIDs.Has(windowID) ? checkedIDs[windowID] : false
-                else
-                    isChecked := (checkedIDs.Count = 0) ? true : checkedIDs.Has(windowID)
-
-                this.State.allWindowData.Push({
-                    windowID: windowID,
-                    title: title,
-                    displayTitle: displayTitle,
-                    class: classWin,
-                    pid: pid,
-                    processName: processName,
-                    isPinned: isPinned,
-                    checked: isChecked
-                })
-            }
-        }
-
-        ; Sort by process name for visual grouping
-        this.SortWindowData()
-
-        ; Populate ListView
-        for item in this.State.allWindowData {
-            if (filter = "" || InStr(item.title, filter) || InStr(item.processName, filter)) {
-                row := this.State.listView.Add(item.checked ? "Check" : "", item.processName, item.displayTitle, item.class, item.pid)
-                this.State.windowData[row] := item.windowID
-            }
-        }
-
-        this.RebuildProcessSubMenu()
-        this.State.refreshCountdown := 5
-        this.UpdateStatus()
-    }
-
-    ApplyFilter() {
-        if !this.State.guiObj
-            return
-
-        ; Sync current checkbox state back to allWindowData before rebuilding
-        this.SyncCheckedState()
-
-        filter := this.State.searchBox.Value
-        this.State.listView.Delete()
-        this.State.windowData := Map()
-
-        for item in this.State.allWindowData {
-            if (filter = "" || InStr(item.title, filter) || InStr(item.processName, filter)) {
-                row := this.State.listView.Add(item.checked ? "Check" : "", item.processName, item.displayTitle, item.class, item.pid)
-                this.State.windowData[row] := item.windowID
-            }
-        }
-
-        this.UpdateStatus()
-    }
-
-    /**
-     * Synchronizes the checked state from the active ListView rows back to allWindowData.
-     */
-    SyncCheckedState() {
-        if !this.State.guiObj
-            return
-
-        ; Build a map of row-to-windowID for currently checked items
-        checkedIDs := Map()
-        row := 0
-        Loop {
-            row := this.State.listView.GetNext(row, "Checked")
-            if !row
-                break
-            if this.State.windowData.Has(row)
-                checkedIDs[this.State.windowData[row]] := true
-        }
-
-        ; Map windowID to true for currently visible rows
-        visibleIDs := Map()
-        for row, wid in this.State.windowData
-            visibleIDs[wid] := true
-
-        ; Update checked state for currently visible windows in allWindowData
-        for item in this.State.allWindowData {
-            if visibleIDs.Has(item.windowID)
-                item.checked := checkedIDs.Has(item.windowID)
-        }
-    }
-
-    /**
-     * Dynamically rebuilds the process selection submenu based on active windows.
-     */
-    RebuildProcessSubMenu() {
-        if (!this.State.guiObj || !this.State.processMenu)
-            return
-
-        try this.State.processMenu.Delete()
-
-        seen := Map()
-        for item in this.State.allWindowData {
-            if !seen.Has(item.processName) {
-                seen[item.processName] := true
-                this.State.processMenu.Add(item.processName, ObjBindMethod(this, "SelectByProcess", item.processName))
-            }
-        }
-
-        if (seen.Count = 0)
-            this.State.processMenu.Add("(no processes)", (*) => "")
-    }
-
-    /**
-     * Toggles a row's checkbox state when the user clicks the row text.
-     * Skips manual toggle if user clicked directly on the checkbox to prevent double-toggling.
-     * @param {Object} LV The ListView control reference.
-     * @param {Integer} RowNumber The clicked row number.
-     */
-    ToggleRowCheckbox(LV, RowNumber) {
-        if (RowNumber = 0)
-            return
-
-        ; Query cursor position relative to the ListView to hit-test where the click occurred
-        pt := Buffer(8)
-        DllCall("user32\GetCursorPos", "Ptr", pt)
-        DllCall("user32\ScreenToClient", "Ptr", LV.Hwnd, "Ptr", pt)
-        x := NumGet(pt, 0, "Int")
-        y := NumGet(pt, 4, "Int")
-
-        ; LVHITTESTINFO structure
-        info := Buffer(24, 0)
-        NumPut("Int", x, info, 0)
-        NumPut("Int", y, info, 4)
-        SendMessage(0x1039, 0, info, LV.Hwnd) ; LVM_SUBITEMHITTEST
-        flags := NumGet(info, 8, "UInt")
-
-        ; LVHT_ONITEMSTATEICON := 0x00000008 (clicked directly on the checkbox icon)
-        if (flags & 0x00000008) {
-            ; Let Windows handle the checkbox toggle automatically, just update status after
-            Sleep(10)
-            this.UpdateStatus()
-        } else {
-            ; Clicked on the row text: toggle the checkbox state manually
-            isChecked := SendMessage(0x102C, RowNumber - 1, 0xF000, LV.Hwnd) ; LVM_GETITEMSTATE
-            isChecked := (isChecked >> 12) - 1
-            LV.Modify(RowNumber, isChecked ? "-Check" : "Check")
-            this.UpdateStatus()
-        }
-    }
-
-    SelectAllWindows(select) {
-        if !this.State.guiObj
-            return
-
-        Loop this.State.listView.GetCount()
-            this.State.listView.Modify(A_Index, select ? "Check" : "-Check")
-
-        this.UpdateStatus()
-    }
-
-    ToggleDetailsMenu(ItemName, ItemPos, MenuObj) {
-        this.State.showDetails := !this.State.showDetails
-        MenuObj.ToggleCheck(ItemName)
-        this.SaveSettings()
-
-        if this.State.showDetails {
-            this.State.listView.ModifyCol(1, 100)
-            this.State.listView.ModifyCol(2, 260)
-            this.State.listView.ModifyCol(3, 120)
-            this.State.listView.ModifyCol(4, 40)
-        } else {
-            this.State.listView.ModifyCol(1, 100)
-            this.State.listView.ModifyCol(2, 400)
-            this.State.listView.ModifyCol(3, 0)
-            this.State.listView.ModifyCol(4, 0)
-        }
-    }
-
-    SortWindowData() {
-        ; Simple insertion sort by processName (small lists)
-        arr := this.State.allWindowData
-        Loop arr.Length - 1 {
-            i := A_Index + 1
-            item := arr[i]
-            j := i - 1
-            while (j >= 1 && StrCompare(arr[j].processName, item.processName) > 0) {
-                arr[j + 1] := arr[j]
-                j--
-            }
-            arr[j + 1] := item
-        }
-    }
-
-    SelectByProcess(processName, *) {
-        if !this.State.guiObj
-            return
-
-        Loop this.State.listView.GetCount() {
-            rowProcess := this.State.listView.GetText(A_Index, 1)
-            if (rowProcess = processName)
-                this.State.listView.Modify(A_Index, "Check")
-        }
-        this.UpdateStatus()
-    }
-
-    /**
-     * Builds and returns a submenu listing all unique active processes for selection.
-     * @returns {Menu} The constructed process selection menu.
-     */
-    BuildProcessSubMenu() {
-        procMenu := Menu()
-        procMenu.Add("(loading...)", (*) => "")
-        return procMenu
-    }
-
-    ; =========================================================================
-    ; CONTEXT MENU ACTIONS
-    ; =========================================================================
-
-    /**
-     * Displays a contextual right-click menu for a specific row/window item.
-     */
-    OnListViewContextMenu(LV, RowNumber, IsRightClick, X, Y) {
-        if (RowNumber = 0 || !this.State.windowData.Has(RowNumber))
-            return
-
-        windowID := this.State.windowData[RowNumber]
-
-        ; Get process name for pin toggle
-        procName := ""
-        try procName := WinGetProcessName("ahk_id " windowID)
-
-        ctx := Menu()
-        ctx.Add("Switch To", (*) => this.SwitchToWindow(windowID))
-        ctx.Add()  ; Separator
-        ctx.Add("Close This", (*) => this.CloseSingleWindow(windowID, false))
-        ctx.Add("Force Close This", (*) => this.CloseSingleWindow(windowID, true))
-        ctx.Add()  ; Separator
-        ctx.Add("Kill Process", (*) => this.KillProcess(windowID))
-        ctx.Add("Kill Process Tree", (*) => this.KillProcessTree(windowID))
-        ctx.Add()  ; Separator
-        if (procName != "") {
-            if this.IsPinned(procName)
-                ctx.Add("Unpin " procName, (*) => this.RemovePin(procName))
-            else
-                ctx.Add("Pin " procName " (Never Close)", (*) => this.AddPin(procName))
-        }
-        ctx.Add()  ; Separator
-        ctx.Add("Keep Only (Close Others)", (*) => this.KeepOnlyWindow(windowID))
-        ctx.Show()
-    }
-
-    SwitchToWindow(windowID) {
-        try {
-            winTitle := "ahk_id " windowID
-            if !WinExist(winTitle) {
-                this.SetStatus("Window no longer exists", true)
-                this.RefreshWindowList()
-                return
-            }
-            WinActivate(winTitle)
-            WinMoveTop(winTitle)
-            this.SetStatus("Switched to window")
-        } catch {
-            this.SetStatus("Could not switch to window", true)
-        }
-    }
-
-    CloseSingleWindow(windowID, forceKill) {
-        try {
-            winTitle := "ahk_id " windowID
-            if !WinExist(winTitle) {
-                this.SetStatus("Window already closed")
-                this.RefreshWindowList()
-                return
-            }
-
-            if ExecuteWindowClose(windowID, forceKill)
-                this.SetStatus("Closed window")
-            else
-                this.SetStatus("Failed to close window", true)
-
-            Sleep(200)
-            this.RefreshWindowList()
-        } catch {
-            this.SetStatus("Error closing window", true)
-        }
-    }
-
-    KeepOnlyWindow(keepWindowID) {
-        if !this.State.guiObj
-            return
-
-        othersIDs := []
-        for row, windowID in this.State.windowData {
-            if (windowID != keepWindowID)
-                othersIDs.Push(windowID)
-        }
-
-        if (othersIDs.Length = 0) {
-            this.SetStatus("No other windows to close")
-            return
-        }
-
-        this.State.guiObj.Opt("+OwnDialogs")
-        result := MsgBox(
-            "Close " othersIDs.Length " other window(s) and keep only the selected one?",
-            "Keep Only", "YesNo Icon?")
-        if (result != "Yes")
-            return
-
-        closedCount := 0
-        failedCount := 0
-        for windowID in othersIDs {
-            if ExecuteWindowClose(windowID, false)
-                closedCount++
-            else
-                failedCount++
-        }
-
-        if (failedCount > 0)
-            this.SetStatus("Closed " closedCount " | " failedCount " failed", true)
-        else
-            this.SetStatus("Closed " closedCount " window(s), kept 1")
-
-        Sleep(300)
-        this.RefreshWindowList()
-    }
-
-    CloseFocusedWindow() {
-        if !this.State.guiObj
-            return
-
-        ; Get the focused (selected) row
-        row := this.State.listView.GetNext(0, "Focused")
-        if (row = 0 || !this.State.windowData.Has(row)) {
-            this.SetStatus("No window focused", true)
-            return
-        }
-
-        windowID := this.State.windowData[row]
-        this.CloseSingleWindow(windowID, false)
-    }
-
-    FocusSearch() {
-        if this.State.searchBox
-            this.State.searchBox.Focus()
-    }
-
-    CloseSelectedWindows(forceKill) {
-        if !this.State.guiObj
-            return
-
-        selectedIDs := []
-        row := 0
-        Loop {
-            row := this.State.listView.GetNext(row, "Checked")
-            if !row
-                break
-            if this.State.windowData.Has(row)
-                selectedIDs.Push(this.State.windowData[row])
-        }
-
-        if (selectedIDs.Length = 0) {
-            this.SetStatus("No windows selected", true)
-            return
-        }
-
-        this.State.guiObj.Opt("+OwnDialogs")
-        action := forceKill ? "FORCE CLOSE" : "close"
-        result := MsgBox(
-            "Are you sure you want to " action " " selectedIDs.Length " window(s)?",
-            "Confirm", "YesNo Icon" (forceKill ? "!" : "?"))
-        if (result != "Yes")
-            return
-
-        closedCount := 0
-        failedCount := 0
-        for windowID in selectedIDs {
-            if ExecuteWindowClose(windowID, forceKill)
-                closedCount++
-            else
-                failedCount++
-        }
-
-        if (failedCount > 0)
-            this.SetStatus("Closed " closedCount " | " failedCount " failed", true)
-        else
-            this.SetStatus("Closed " closedCount " window(s)")
-
-        ; Count total unpinned windows and how many of them were selected before refreshing
-        unpinnedCount := 0
-        for item in this.State.allWindowData {
-            if !item.isPinned
-                unpinnedCount++
-        }
-
-        selectedUnpinnedCount := 0
-        for selectedID in selectedIDs {
-            for item in this.State.allWindowData {
-                if (item.windowID = selectedID && !item.isPinned) {
-                    selectedUnpinnedCount++
-                    break
-                }
-            }
-        }
-
-        Sleep(300)
-        this.RefreshWindowList()
-
-        ; Trigger post-close power action only if we closed ALL unpinned windows and none failed
-        if (closedCount > 0 && failedCount = 0 && selectedUnpinnedCount >= unpinnedCount)
-            this.ExecutePostCloseAction()
-    }
-
-    ; =========================================================================
-    ; POWER ACTION METHODS
-    ; =========================================================================
-
-    OnPowerActionChange() {
-        try {
-            this.State.defaultPowerAction := this.State.powerActionDDL.Value
-            this.SaveSettings()
-        }
-    }
-
-    OnAutoExecuteChange() {
-        try {
-            this.State.autoExecute := this.State.autoExecuteChk.Value
-            this.SaveSettings()
-        }
-    }
-
-    ExecutePostCloseAction() {
-        actionIndex := this.State.defaultPowerAction
-        if (actionIndex <= 1)  ; "Nothing" or invalid
-            return
-
-        actionName := Config.PowerActions[actionIndex]
-
-        ; Show countdown dialog (short countdown if autoExecute, full otherwise)
-        this.ShowCountdownDialog(actionName)
-    }
-
-    ShowCountdownDialog(actionName) {
-        ; Close main GUI first
-        this.CloseGui()
-
-        this.State.countdownAction := actionName
-        countdownTime := this.State.autoExecute ? 3 : this.State.countdownSeconds
-        this.State.countdownRemaining := countdownTime
-
-        cg := Gui("+AlwaysOnTop +ToolWindow -MinimizeBox", APP_NAME " - " actionName)
-        this.SetModernFont(cg)
-        cg.OnEvent("Close", (*) => this.CancelCountdown())
-
-        ; Title
-        cg.SetFont("s12 Bold", "Segoe UI")
-        cg.AddText("w300 Center Section", actionName " in " countdownTime "s...")
-
-        ; Progress bar
-        cg.SetFont("s9 Norm", "Segoe UI")
-        this.State.countdownProgressCtrl := cg.AddProgress("xs w300 h20 Range0-" countdownTime, countdownTime)
-
-        ; Countdown text
-        this.State.countdownTextCtrl := cg.AddText("xs w300 Center", countdownTime " seconds remaining")
-
-        ; Execute Now + Cancel buttons
-        cg.AddButton("xs w145 h28", "&" actionName " Now").OnEvent("Click", (*) => this.ExecuteCountdownNow())
-        cg.AddButton("x+10 yp w145 h28", "&Cancel").OnEvent("Click", (*) => this.CancelCountdown())
-
-        ; Register Escape to cancel, Enter to execute now
-        HotIfWinActive("ahk_id " cg.Hwnd)
-        Hotkey("Escape", (*) => this.CancelCountdown())
-        Hotkey("Enter", (*) => this.ExecuteCountdownNow())
-        HotIfWinActive()
-
-        this.State.countdownGui := cg
-        cg.Show("AutoSize")
-
-        ; Start countdown timer
-        SetTimer(this.CountdownDialogTickFn, 1000)
-    }
-
-    CountdownDialogTick() {
-        if !this.State.countdownGui
-            return
-
-        this.State.countdownRemaining--
-
-        if (this.State.countdownRemaining <= 0) {
-            ; Time's up — execute
-            actionName := this.State.countdownAction
-            this.CancelCountdown()
-            ExecutePowerAction(actionName)
-            return
-        }
-
-        try {
-            this.State.countdownProgressCtrl.Value := this.State.countdownRemaining
-            this.State.countdownTextCtrl.Text := this.State.countdownRemaining " seconds remaining"
-        }
-    }
-
-    /**
-     * Immediately executes the pending power action, skipping the remaining countdown.
-     */
-    ExecuteCountdownNow() {
-        actionName := this.State.countdownAction
-        this.CancelCountdown()
-        ExecutePowerAction(actionName)
-    }
-
-    CancelCountdown() {
-        SetTimer(this.CountdownDialogTickFn, 0)
-
-        if this.State.countdownGui {
-            try {
-                HotIfWinActive("ahk_id " this.State.countdownGui.Hwnd)
-                Hotkey("Escape", "Off")
-                Hotkey("Enter", "Off")
-                HotIfWinActive()
-            }
-            try this.State.countdownGui.Destroy()
-        }
-
-        this.State.countdownGui := false
-        this.State.countdownAction := ""
-        this.State.countdownRemaining := 0
-    }
-
-    ForceCloseAllAndAction() {
-        windows := []
-        for windowID in GetVisibleWindows() {
-            try {
-                pName := WinGetProcessName("ahk_id " windowID)
-                if !this.IsPinned(pName)
-                    windows.Push(windowID)
-            } catch {
-                windows.Push(windowID)
-            }
-        }
-
-        if (windows.Length = 0) {
-            ToolTip("No windows to close")
-            SetTimer(() => ToolTip(), -1500)
-            return
-        }
-
-        result := MsgBox("FORCE CLOSE all " windows.Length " windows?", "Warning", "YesNo Icon!")
-        if (result != "Yes")
-            return
-
-        for windowID in windows
-            try WinKill("ahk_id " windowID)
-
-        ToolTip("Force-closed " windows.Length " windows")
-        SetTimer(() => ToolTip(), -2000)
-
-        ; Offer power action if one was previously selected and respect autoExecute
-        if (this.State.defaultPowerAction > 1) {
-            Sleep(1000)
-            this.ExecutePostCloseAction()
-        }
-    }
-
-    ; =========================================================================
-    ; PROCESS KILL METHODS
-    ; =========================================================================
-
-    KillProcess(windowID) {
-        try {
-            winTitle := "ahk_id " windowID
-            if !WinExist(winTitle) {
-                this.SetStatus("Window already gone")
-                this.RefreshWindowList()
-                return
-            }
-
-            pid := WinGetPID(winTitle)
-            ProcessClose(pid)
-            Sleep(500)
-            this.SetStatus("Killed process (PID: " pid ")")
-            this.RefreshWindowList()
-        } catch {
-            this.SetStatus("Failed to kill process", true)
-        }
-    }
-
-    KillProcessTree(windowID) {
-        try {
-            winTitle := "ahk_id " windowID
-            if !WinExist(winTitle) {
-                this.SetStatus("Window already gone")
-                this.RefreshWindowList()
-                return
-            }
-
-            pid := WinGetPID(winTitle)
-            Run(A_ComSpec ' /c taskkill /F /T /PID ' pid, , "Hide")
-            Sleep(500)
-            this.SetStatus("Killed process tree (PID: " pid ")")
-            this.RefreshWindowList()
-        } catch {
-            this.SetStatus("Failed to kill process tree", true)
-        }
-    }
-
-    ; =========================================================================
-    ; PINNED WINDOWS
-    ; =========================================================================
-
-    IsPinned(processName) {
-        for proc in this.State.pinnedProcesses {
-            if (proc = processName)
-                return true
-        }
-        return false
-    }
-
-    AddPin(processName, *) {
-        if !this.IsPinned(processName) {
-            this.State.pinnedProcesses.Push(processName)
-            this.SaveSettings()
-            this.SetStatus("Pinned: " processName)
-            this.RefreshWindowList()
-        }
-    }
-
-    RemovePin(processName, *) {
-        newList := []
-        for proc in this.State.pinnedProcesses {
-            if (proc != processName)
-                newList.Push(proc)
-        }
-        this.State.pinnedProcesses := newList
-        this.SaveSettings()
-        this.SetStatus("Unpinned: " processName)
-        this.RefreshWindowList()
-    }
-
-    ; =========================================================================
-    ; PROFILES
-    ; =========================================================================
-
-    BuildProfilesMenu() {
-        profMenu := Menu()
-
-        for i, profile in this.State.profiles {
-            profMenu.Add(profile.name, ObjBindMethod(this, "RunProfile", i))
-        }
-
-        profMenu.Add()  ; Separator
-        profMenu.Add("Edit Profiles...", (*) => Run("notepad.exe `"" CONFIG_FILE "`""))
-
-        return profMenu
-    }
-
-    /**
-     * Executes a quick-close profile, closing all matching windows and applying post-close actions.
-     * @param {Integer} profileIndex The 1-based index of the profile.
-     */
-    RunProfile(profileIndex, *) {
-        if (profileIndex < 1 || profileIndex > this.State.profiles.Length)
-            return
-
-        profile := this.State.profiles[profileIndex]
-        excludeList := StrSplit(profile.exclude, "|")
-
-        ; Close main GUI if open
-        this.CloseGui()
-
-        ; Gather windows to close
-        windows := GetVisibleWindows()
-        toClose := []
-
-        for windowID in windows {
-            try {
-                pName := WinGetProcessName("ahk_id " windowID)
-
-                ; Skip excluded processes (exact match or with extension shortcut)
-                isExcluded := false
-                for pattern in excludeList {
-                    if (pattern != "" && (pName = pattern || pName = pattern ".exe")) {
-                        isExcluded := true
-                        break
-                    }
-                }
-
-                ; Skip pinned processes
-                if this.IsPinned(pName)
-                    isExcluded := true
-
-                if !isExcluded
-                    toClose.Push(windowID)
-            }
-        }
-
-        if (toClose.Length = 0) {
-            ToolTip("No windows to close for profile: " profile.name)
-            SetTimer(() => ToolTip(), -2000)
-        } else {
-            result := MsgBox(
-                "Profile: " profile.name "`n`n"
-                "Close " toClose.Length " window(s)?"
-                (profile.action != "Nothing" ? "`nThen: " profile.action : ""),
-                APP_NAME, "YesNo Icon?")
-            if (result != "Yes")
-                return
-
-            for windowID in toClose
-                ExecuteWindowClose(windowID, false)
-
-            ToolTip("Profile '" profile.name "': closed " toClose.Length " windows")
-            SetTimer(() => ToolTip(), -2000)
-        }
-
-        ; Execute power action if specified
-        if (profile.action != "Nothing" && toClose.Length > 0) {
-            Sleep(1000)
-            this.ShowCountdownDialog(profile.action)
-        }
-    }
-
-    ; =========================================================================
-    ; SETTINGS PERSISTENCE
-    ; =========================================================================
-
-    /**
-     * Loads the application settings, pinned processes, and quick profiles from the INI file.
-     * Auto-initializes and saves default profiles on the first run.
-     */
-    LoadSettings() {
-        if FileExist(CONFIG_FILE) {
-            try {
-                this.State.defaultPowerAction := Integer(IniRead(CONFIG_FILE, "Settings", "DefaultPowerAction", 2))
-                this.State.autoExecute := Integer(IniRead(CONFIG_FILE, "Settings", "AutoExecute", 0))
-                this.State.countdownSeconds := Integer(IniRead(CONFIG_FILE, "Settings", "CountdownSeconds", 10))
-                this.State.showDetails := Integer(IniRead(CONFIG_FILE, "Settings", "ShowDetails", 1))
-
-                ; Load pinned processes
-                this.State.pinnedProcesses := []
-                Loop {
-                    entry := IniRead(CONFIG_FILE, "PinnedProcesses", "Entry" A_Index, "")
-                    if (entry = "")
-                        break
-                    this.State.pinnedProcesses.Push(entry)
-                }
-
-                ; Load profiles
-                this.State.profiles := []
-                Loop {
-                    name := IniRead(CONFIG_FILE, "Profile" A_Index, "Name", "")
-                    if (name = "")
-                        break
-                    this.State.profiles.Push({
-                        name: name,
-                        action: IniRead(CONFIG_FILE, "Profile" A_Index, "Action", "Nothing"),
-                        exclude: IniRead(CONFIG_FILE, "Profile" A_Index, "Exclude", "")
-                    })
-                }
-            }
-        }
-
-        ; Create default profiles if none exist (handles first run or deleted config)
-        if (this.State.profiles.Length = 0) {
-            this.State.profiles := [{ name: "End of Day", action: "Shutdown", exclude: "" }, { name: "Focus Mode", action: "Nothing", exclude: "Code.exe|WindowsTerminal.exe" }, { name: "Meeting Mode", action: "Nothing", exclude: "ms-teams.exe|Teams.exe|Zoom.exe" }
-            ]
-            this.SaveSettings()
-        }
-    }
-
-    /**
-     * Persists the current settings, pinned processes, and profiles back to the INI file.
-     * Cleans up stale configuration sections dynamically.
-     */
-    SaveSettings() {
-        try {
-            IniWrite(this.State.defaultPowerAction, CONFIG_FILE, "Settings", "DefaultPowerAction")
-            IniWrite(this.State.autoExecute, CONFIG_FILE, "Settings", "AutoExecute")
-            IniWrite(this.State.countdownSeconds, CONFIG_FILE, "Settings", "CountdownSeconds")
-            IniWrite(this.State.showDetails, CONFIG_FILE, "Settings", "ShowDetails")
-
-            ; Save pinned processes
-            try IniDelete(CONFIG_FILE, "PinnedProcesses")
-            for i, proc in this.State.pinnedProcesses
-                IniWrite(proc, CONFIG_FILE, "PinnedProcesses", "Entry" i)
-
-            ; Dynamic cleanup of all existing Profile sections in INI
-            i := 1
-            Loop {
-                if (IniRead(CONFIG_FILE, "Profile" i, "Name", "") = "")
-                    break
-                try IniDelete(CONFIG_FILE, "Profile" i)
-                i++
-            }
-
-            ; Save active profiles
-            for i, profile in this.State.profiles {
-                IniWrite(profile.name, CONFIG_FILE, "Profile" i, "Name")
-                IniWrite(profile.action, CONFIG_FILE, "Profile" i, "Action")
-                IniWrite(profile.exclude, CONFIG_FILE, "Profile" i, "Exclude")
-            }
-        }
-    }
-}
-
-; =============================================================================
-; GLOBAL HELPERS
-; =============================================================================
-
-/**
- * Closes a window gracefully with escalation to force-kill if it hangs.
- * @param {Integer} windowID The Hwnd identifier of the window.
- * @param {Boolean} forceKill If true, skips graceful close and force-kills immediately.
- * @returns {Boolean} True if successfully closed/killed, false otherwise.
- */
-ExecuteWindowClose(windowID, forceKill) {
-    try {
-        winTitle := "ahk_id " windowID
-
-        if !WinExist(winTitle)
-            return true  ; Already gone
-
-        if forceKill {
-            WinKill(winTitle)
-            return WinWaitClose(winTitle, , 0.5)
-        }
-
-        ; Step 1: Graceful close
-        WinClose(winTitle)
-        if WinWaitClose(winTitle, , 0.5)
-            return true
-
-        ; Step 2: Retry with longer wait
-        if WinExist(winTitle) {
-            WinClose(winTitle)
-            if WinWaitClose(winTitle, , 1)
-                return true
-        }
-
-        ; Step 3: Force kill as last resort
-        if WinExist(winTitle) {
-            WinKill(winTitle)
-            return WinWaitClose(winTitle, , 0.5)
-        }
-
-        return true
-    } catch {
-        return true  ; Window likely gone
-    }
-}
-
-/**
- * Triggers the requested Windows post-close power action.
- * @param {String} actionName The power action name (e.g. Shutdown, Sleep, Lock Screen).
- */
-ExecutePowerAction(actionName) {
-    switch actionName {
-        case "Shutdown":
-            Shutdown(1)
-        case "Restart":
-            Shutdown(2)
-        case "Sleep":
-            DllCall("PowrProf\SetSuspendState", "Int", 0, "Int", 0, "Int", 0)
-        case "Hibernate":
-            DllCall("PowrProf\SetSuspendState", "Int", 1, "Int", 0, "Int", 0)
-        case "Lock Screen":
-            DllCall("user32\LockWorkStation")
-    }
-}
-
-/**
- * Gathers a list of all visible closeable windows currently open.
- * @returns {Array} List of Hwnd integers.
- */
-GetVisibleWindows() {
-    visibleWindows := []
-    for windowID in WinGetList() {
-        if IsWindowCloseable(windowID, 0)
-            visibleWindows.Push(windowID)
-    }
-    return visibleWindows
-}
-
-/**
- * Evaluates whether a window is closeable and should be included in the selector.
- * Safety-guards against self-termination and filters out cloaked/hidden/system elements.
- * @param {Integer} windowID The Hwnd identifier of the window.
- * @param {Integer} guiHwnd The Hwnd identifier of the main app GUI to explicitly ignore.
- * @returns {Boolean} True if closeable, false otherwise.
- */
-IsWindowCloseable(windowID, guiHwnd) {
-    try {
-        title := WinGetTitle("ahk_id " windowID)
-        style := WinGetStyle("ahk_id " windowID)
-        exStyle := WinGetExStyle("ahk_id " windowID)
-        classWin := WinGetClass("ahk_id " windowID)
-
-        ; Must have a title
-        if (title = "")
-            return false
-
-        ; WS_DISABLED (ignore disabled control dialogs/subwindows)
-        if (style & 0x08000000)
-            return false
-
-        ; Must be WS_VISIBLE (ignore hidden background windows)
-        if !(style & 0x10000000)
-            return false
-
-        ; WS_EX_TOOLWINDOW (ignore background/tray assistant tool windows)
-        if (exStyle & 0x00000080)
-            return false
-
-        ; Skip all windows belonging to our own script process (safety guard)
-        if (WinGetPID("ahk_id " windowID) = ProcessExist())
-            return false
-
-        ; Check if cloaked (suspended UWP app or window on another virtual desktop)
-        if IsCloaked(windowID)
-            return false
-
-        ; Check excluded classes
-        for excludedClass in Config.ExcludedClasses
-            if (classWin = excludedClass)
-                return false
-
-        ; Check excluded titles
-        for excludedTitle in Config.ExcludedTitles
-            if InStr(title, excludedTitle)
-                return false
-
-        return true
-    } catch {
-        return false
-    }
-}
-
-/**
- * Checks if a window is cloaked via Windows Desktop Window Manager (DWM).
- * Cloaked windows include suspended UWP apps and windows active on other Virtual Desktops.
- * @param {Integer} windowID The Hwnd identifier of the window.
- * @returns {Boolean} True if cloaked, false otherwise.
- */
-IsCloaked(windowID) {
-    cloaked := 0
-    try {
-        ; DWMWA_CLOAKED := 14
-        DllCall("dwmapi\DwmGetWindowAttribute", "Ptr", windowID, "UInt", 14, "Int*", &cloaked, "UInt", 4)
-        return cloaked != 0
-    } catch {
-        return false
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-;============================================================================
-; AutoHotkey V2 - Daily Use Script (HCL Tech)
-;============================================================================
-; Keyboard shortcuts reference:
+;********************************************;
+; Keyboard shortcuts - AutoHotKey V2
 ; (hash)                #    Windows logo key
 ; (exclamation mark)    !    ALT
 ; (caret)               ^    CTRL
 ; (plus)                +    Shift
-;============================================================================
+;********************************************;
 
 #Requires AutoHotkey v2.0
-#SingleInstance Force
-; #NoTrayIcon
+#SingleInstance Force ; only allow one instance of the script to run at a time
+#NoTrayIcon
 
-Persistent
+Persistent ; Keeps script permanently running
+; SetTitleMatchMode 2 ; Case-insensitive and partial title matching
 SetTitleMatchMode "RegEx"
-SendMode "Input"
+SendMode "Input"  ; Recommended for new scripts due to its superior speed and reliability.
 
-#Hotstring EndChars (){}[];:'"/\,.?!`n `t
-A_MaxHotkeysPerInterval := 200
+#Hotstring EndChars (){}[];:'"/\,.?!`n `t ;Removed '-'
 
-; Run(A_ComSpec ' /c AutoHotkeyV2 "' A_ScriptDir '\closeAll_v3.ahk"', , "hide")
-Run(A_AhkPath ' "' A_ScriptDir '\CloseAll.ahk"', , "hide")
+; #Include "C:\Users\Ashutosh Rout\Proton Drive\rout.ashutosh\My files\Sync\GitHub\autohotkey\Version2\ExplorerDialogPathSelector.ahk"
 
-;============================================================================
-; INCLUDES
-;============================================================================
+; Launch companion scripts with error handling
+try Run('"' A_ScriptDir '\AHKControl V2\AHKControl.ahk"')
+try Run('"C:\Users\Ashutosh Rout\Proton Drive\rout.ashutosh\My files\Sync\ahkScripts\V2\autoCorrect.ahk"')
+try Run('"' A_ScriptDir '\Toggle_Win_Taskbar.ahk"')
+try Run('"' A_ScriptDir '\taskbar_volume.ahk"')
+try Run('"' A_ScriptDir '\CloseAll.ahk"')
+try Run('"' A_ScriptDir '\brightness_knob.ahk"')
+try Run('"' A_ScriptDir '\FamilyAgeTracker.ahk"')
 
-;#Include decrypt.ahk
-;#Include namingtr.ahk
-#Include StartupManager.ahk
+; Remap AppsKey to PrintScreen
+AppsKey::PrintScreen
 
-;============================================================================
-; CONSTANTS
-;============================================================================
-
-; Sleep durations (milliseconds)
-global SLEEP_SHORT := 300
-global SLEEP_MEDIUM := 500
-global SLEEP_LONG := 1500
-
-; Work apps and URLs are now loaded from startup_config.ini via StartupManager.ahk
-
-; User credentials (encrypted)
-global SAP_USER := "EXT-ASHROU"
-global SAP_PASSWORD_1 := "FBwGHk89eSQMClE0AQpg"
-global SAP_PASSWORD_2 := "FBwGHk89eSQMClE0ARwjWQ=="
-global CSC_PASSWORD := "AV4YKUMuXyo="
-
-;============================================================================
-; TRAY MENU SETUP
-;============================================================================
-
-SetupTrayMenu() {
-    A_TrayMenu.Delete()  ; Clear default menu
-    A_TrayMenu.Add("📋 Show Hotkey Help", (*) => (ShowHotkeyHelp(), 0))
-    A_TrayMenu.Add()  ; Separator
-    A_TrayMenu.Add("🚀 Launch Work Apps", (*) => (LaunchWorkApps(), 0))
-    A_TrayMenu.Add("⚙️ Startup Manager", (*) => (ShowStartupManager(), 0))
-    A_TrayMenu.Add("⏸️ Pause Script", (*) => (Pause(), 0))
-    A_TrayMenu.Add("🔇 Suspend Hotkeys", (*) => (Suspend(), 0))
-    A_TrayMenu.Add("🔄 Reload Script", (*) => (Reload(), 0))
-    A_TrayMenu.Add()
-    A_TrayMenu.Add("❌ Exit", (*) => (ExitApp(), 0))
-    A_TrayMenu.Default := "📋 Show Hotkey Help"
+;Unread emails
+$^/::
+{
+    ; Wait for both keys to be released to prevent bleed-through
+    KeyWait("Ctrl")
+    KeyWait("/")
+    Sleep(50)
+    Send("{Escape 2}")    ; Close search bar (twice: clear suggestions + close)
+    Sleep(100)
+    Send("/")             ; Open Gmail search bar fresh
+    Sleep(200)            ; Wait for search bar to fully open
+    Send("is:unread{Enter}")
 }
 
-SetupTrayMenu()
+; Trigger CopyQ
+#v::
+{
+    Send "!v"
+    return
+}
+; -------------------------------------------------------------------------------
 
-;============================================================================
-; UTILITY FUNCTIONS
-;============================================================================
+; Restart Explorer
+!F2:: ProcessClose("explorer.exe")
 
-/**
- * Gets the current date formatted as dd.MM.yyyy and sends it
- */
-curr_working_date() {
-    Send FormatTime(A_Now, "dd.MM.yyyy")
+
+; Greenshot & ShareX
+#HotIf WinActive("ahk_exe Greenshot.exe") or WinActive("ahk_exe ShareX.exe")
+; Copy to clipboard
+^c:: Send("^+c")
+#HotIf
+
+#HotIf not (WinActive("ahk_exe EXCEL.EXE") or WinActive("ahk_exe eclipse.exe"))
+
+{
+    RCtrl & Left::Media_Prev        ; Previous Media
+    RCtrl & Right::Media_Next       ; Next Media
+    ^Space::Media_Play_Pause        ; Pause Media
+    ^Up:: Send "{Volume_Up 2}"      ; Increase sound
+    ^Down:: Send "{Volume_Down 2}"  ; Decrease sound
+
+
+    ^Left:: Send "{Home}"           ; Home
+    ^Right:: Send "{End}"           ; End
 }
 
-/**
+#HotIf
+
+#HotIf WinActive(A_ScriptName ".+- Visual Studio Code")
+; Reload the script during saving
+~^s:: Reload()
+#HotIf
+
+
+/*
+**
  * ClipSend - Sends text via clipboard, optionally restoring the original clipboard content.
  * @param toSend The text to send.
  * @param endChar Optional character to append (default: "").
  * @param isClipReverted If true, restores the original clipboard after sending (default: true).
  * @param untilRevert Delay in ms before restoring the clipboard (default: 100).
  * @returns {Boolean} True if successful, false if ClipWait failed.
- */
+*/
 ClipSend(toSend, endChar := "", isClipReverted := true, untilRevert := 100) {
     if isClipReverted
         prevClip := ClipboardAll()
@@ -1473,343 +114,7 @@ ClipSend(toSend, endChar := "", isClipReverted := true, untilRevert := 100) {
     return true
 }
 
-;============================================================================
-; MEETING REMINDER - Checks every 30 seconds
-;============================================================================
-
-global _meetingReminderShown := ""  ; Track which day reminder was shown
-
-; Start timer to check meeting time every 30 seconds
-SetTimer(CheckMeetingTime, 30000)
-
-/**
- * Checks if it's time for daily meeting (13:00 on weekdays)
- * Shows reminder once per day
- */
-CheckMeetingTime() {
-    global _meetingReminderShown
-
-    ; Only weekdays (Mon=2 to Fri=6)
-    if (A_WDay < 2 || A_WDay > 6)
-        return
-
-    ; Check if it's 13:00 (1 PM)
-    if (A_Hour != 13 || A_Min != 0)
-        return
-
-    ; Prevent showing multiple times on same day
-    today := A_YYYY . A_MM . A_DD
-    if (_meetingReminderShown = today)
-        return
-
-    _meetingReminderShown := today
-
-    ; Show reminder (non-blocking)
-    MsgBox("🔔 Join daily meeting!", "Meeting Reminder", "T30 262144")  ; Auto-close after 30 sec
-}
-
-/**
- * Checks if a window is visible based on its properties
- * @param windowID The window handle to check
- * @returns {Boolean} True if window is visible
- */
-IsWindowVisible(windowID) {
-    title := WinGetTitle("ahk_id " . windowID)
-    style := WinGetStyle("ahk_id " . windowID)
-    exStyle := WinGetExStyle("ahk_id " . windowID)
-    myclass := WinGetClass("ahk_id " . windowID)
-
-    return !(
-        title = "" ||
-        style & 0x08000000 ||      ; WS_DISABLED
-        !(style & 0x10000000) ||   ; WS_VISIBLE
-        exStyle & 0x00000080 ||    ; WS_EX_TOOLWINDOW
-        myclass = "TApplication"
-    )
-}
-
-/**
- * Performs SAP login with the specified password
- * @param password Encrypted password to use
- * @param prefix Optional prefix commands to send before login
- */
-SAPLogin(password, prefix := "") {
-    if prefix
-        Send prefix
-    Send("^a" . SAP_USER)
-    SendInput("{TAB}")
-    Sleep(SLEEP_SHORT)
-    ;Send DecryptText(password)
-    Sleep(SLEEP_MEDIUM)
-    SendInput("{Enter}")
-}
-
-/**
- * Performs dialog window login
- * @param password Encrypted password to use
- */
-DialogLogin(password) {
-    WinActivate("ahk_class #32770")
-    Sleep SLEEP_MEDIUM
-    ControlFocus "Edit3", "A"
-    Sleep(SLEEP_SHORT)
-    ;Send DecryptText(password)
-    Sleep(SLEEP_MEDIUM)
-    SendInput("{Enter}")
-}
-
-/**
- * Launches work applications intelligently:
- * - Skips apps that are already running
- * - Validates file paths before launching
- * - Launches in parallel (no waiting)
- * - Shows tooltip with launch summary
- */
-LaunchWorkApps() {
-    launched := []
-    skipped := []
-    failed := []
-
-    ToolTip("🚀 Launching work applications...")
-
-    for app in GetWorkApps() {
-        ; For browsers like Edge that run background processes, check for visible windows
-        if (app.process = "msedge.exe" || app.process = "brave.exe" || app.process = "chrome.exe") {
-            ; Check if there's an actual visible browser window
-            if WinExist("ahk_exe " . app.process) {
-                skipped.Push(app.name)
-                continue
-            }
-        } else if ProcessExist(app.process) {
-            ; For other apps, simple process check is sufficient
-            skipped.Push(app.name)
-            continue
-        }
-
-        ; Validate path exists (skip for shell: protocol which is used for UWP apps)
-        if !InStr(app.path, "shell:") && !FileExist(app.path) {
-            failed.Push(app.name . " (not found)")
-            continue
-        }
-
-        ; Launch the application
-        try {
-            Run app.path
-            launched.Push(app.name)
-        } catch {
-            failed.Push(app.name . " (error)")
-        }
-    }
-
-    ; Build summary message
-    summary := ""
-    if launched.Length
-        summary .= "✅ Launched: " . ArrayJoin(launched, ", ") . "`n"
-    if skipped.Length
-        summary .= "⏭️ Already running: " . ArrayJoin(skipped, ", ") . "`n"
-    if failed.Length
-        summary .= "❌ Failed: " . ArrayJoin(failed, ", ")
-
-    ; Open work URLs in default browser
-    workUrls := GetWorkUrls()
-    for urlItem in workUrls {
-        try Run(urlItem.url)
-    }
-    if workUrls.Length
-        summary .= "🌐 Opened " . workUrls.Length . " URLs`n"
-
-    ; Show summary tooltip
-    ToolTip(summary ? summary : "✅ All apps launched!")
-    SetTimer(() => ToolTip(), -3000)  ; Clear after 3 seconds
-}
-
-/**
- * Joins array elements into a string with separator
- */
-ArrayJoin(arr, sep := ", ") {
-    result := ""
-    for i, item in arr
-        result .= (i > 1 ? sep : "") . item
-    return result
-}
-
-/**
- * Shows a help dialog with all available hotkeys
- */
-ShowHotkeyHelp() {
-    helpText := "
-    (
-        🔑 GLOBAL HOTKEYS
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        Win+F1           Show this help
-        Win+V            Open Ditto clipboard
-        Win+Esc          Close all windows (with confirmation)
-        Alt+WheelUp/Down Volume ±5%
-        Alt+N            Send name in form fields
-        Ctrl+Alt+H       Open HealthBreak settings
-        Ctrl+Alt+P       Pause script
-        Ctrl+Alt+S       Suspend hotkeys
-        Ctrl+Alt+R       Reload script
-        
-        🎵 MEDIA (Except in Excel)
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        Ctrl+Alt+Space   Play/Pause media
-        Ctrl+Up/Down     Volume ±2
-        RCtrl+Left/Right Home/End keys
-        
-        🖥️ DESKTOP (On desktop only)
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        Ctrl+Q           Launch all work apps
-        Ctrl+Alt+Shift+Q Open Startup Manager
-        
-        📷 IRFANVIEW
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        Ctrl+H           Toggle minimal view
-        
-        🏢 SAP LOGON
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        Ctrl+1           Login (password 1)
-        Ctrl+2           Login client 110 (password 1)
-        Ctrl+3           Login (password 2)
-        
-        📝 HOTSTRINGS (type + space)
-        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        dt               Current date (dd.MM.yyyy)
-        @@@              Email address
-        br,              Signature
-        ty, gm, ga, ge   Greetings
-        ahknote          AHK script template
-    )"
-    MsgBox(helpText, "Hotkey Reference - Daily Use Script", "4096")
-}
-
-;============================================================================
-; AUTO-RELOAD ON SAVE (VS Code)
-;============================================================================
-
-#HotIf WinActive(A_ScriptName ".+- Visual Studio Code")
-~^s:: Reload()
-#HotIf
-
-;============================================================================
-; GLOBAL HOTKEYS
-;============================================================================
-
-; Trigger Ditto with default Windows clipboard shortcut
-#v:: Send "!v"
-
-; Show hotkey help
-#F1:: ShowHotkeyHelp()
-
-; Open Startup Manager settings
-^!+q:: ShowStartupManager()
-
-; Volume control with Alt + Mouse Wheel
-!WheelUp:: SoundSetVolume("+5")
-!WheelDown:: SoundSetVolume(-5)
-
-; Script control hotkeys
-^!p:: Pause()     ; Pause script
-^!s:: Suspend()   ; Suspend script
-^!r:: Reload()    ; Reload script
-
-; Current Date
-::dt:: curr_working_date()
-
-; Send name in form fields
-!n:: Send "Ashutosh{TAB}Rout{TAB}"
-
-; Close all visible windows - launches Window Manager GUI
-
-;============================================================================
-; MEDIA CONTROLS (Except Excel)
-;============================================================================
-
-#HotIf not WinActive("ahk_exe EXCEL.EXE")
-^!Space::Media_Play_Pause
-^Up:: Send "{Volume_Up 2}"
-^Down:: Send "{Volume_Down 2}"
-RCtrl & Left:: Send "{Home}"
-RCtrl & Right:: Send "{End}"
-#HotIf
-
-;============================================================================
-; CSC UI - Auto Login
-;============================================================================
-
-#HotIf WinActive("ahk_exe csc_ui.exe")
-^!p::
-{
-    WinActivate("ahk_exe csc_ui.exe")
-    Sleep SLEEP_MEDIUM
-    ControlFocus "Edit2", "A"
-    Sleep SLEEP_SHORT
-    ;Send DecryptText(CSC_PASSWORD)
-    Sleep SLEEP_SHORT
-    ControlFocus "Edit3", "A"
-    Sleep SLEEP_SHORT
-    Send "push"
-    Sleep SLEEP_MEDIUM
-    ControlClick "Button1", "A"
-}
-#HotIf
-
-;============================================================================
-; IRFANVIEW - Minimal View Toggle
-;============================================================================
-
-#HotIf WinActive("ahk_class IrfanView")
-^h::
-{
-    Send("!+s")    ; Toggle status bar
-    Sleep(50)
-    Send("!+t")    ; Toggle toolbar
-    Sleep(50)
-    Send("!+m")    ; Toggle menu bar
-}
-#HotIf
-
-;============================================================================
-; DESKTOP - Quick Launch Applications
-;============================================================================
-
-#HotIf WinActive("ahk_class WorkerW") || WinActive("ahk_class Progman")
-^q:: LaunchWorkApps()
-#HotIf
-
-;============================================================================
-; GREENSHOT - Copy Override
-;============================================================================
-
-#HotIf WinActive("ahk_exe Greenshot.exe")
-^c:: Send("^+c")
-#HotIf
-
-;============================================================================
-; DIALOG WINDOWS (#32770) - Auto Login
-;============================================================================
-
-#HotIf WinActive("ahk_class #32770")
-^1:: DialogLogin(SAP_PASSWORD_1)
-^2:: DialogLogin(SAP_PASSWORD_2)
-^3:: DialogLogin(SAP_PASSWORD_2)
-#HotIf
-
-;============================================================================
-; SAP LOGON - Auto Login
-;============================================================================
-
-#HotIf WinActive("SAP")
-^1:: SAPLogin(SAP_PASSWORD_1)
-^2:: SAPLogin(SAP_PASSWORD_1, "+{TAB}110{TAB}")
-^3:: SAPLogin(SAP_PASSWORD_2)
-#HotIf
-
-;============================================================================
-; HOTSTRINGS - Text Expansions
-;============================================================================
-
-; AHK script template
+; Hotstring: Type "ahknote" to insert AHK v2 script template
 ::ahknote::
 {
     ClipSend("
@@ -1832,60 +137,273 @@ RCtrl & Right:: Send "{End}"
     )")
 }
 
-;----------------------------------------------------------------------------
-; Common Abbreviations
-;----------------------------------------------------------------------------
+::redditpost::
+{
+    clipsend("
+    (
+        Hi there!
+        
+        I have a script that fast types test using the shortcut.
+        Below is the code:
+        ```
+        ::yt::
+        {
+            Send "https://www.youtube.com/"
+            Return
+        }
+        ```
+        But when I tried to type yt-dlp (for example), it's not allowing to write the whole word.
+        I thought only hitting space after yt will trigger the shortcut.
+        
+        Could someone please suggest any workaround/ solution for this issue.
+        
+        Thank you in advance.
+    )")
+}
 
-::ahkey::autohotkey
+
+#HotIf WinActive("ahk_class mintty")
+{
+    ::gp::
+    {
+        Send 'git pull ' A_Clipboard
+        return
+    }
+
+    ::gc::
+    {
+        Send 'git clone ' A_Clipboard
+        Return
+    }
+}
+#HotIf
+
+; CHAT-GPT Prompts
+
+::rr::rewrite romantically
 ::rf::rewrite formally
 ::ok::Okay
-::eg::e.g.
-::dont::don't
-::don;t::don't
-::can;t::can't
-::isn;t::isn't
-::ack::Acknowledged
-::ss::screenshot
-::ref::reference
-::yw::You're welcome.
-::inc::incident
-::tct::ticket
+::af::Alias for
+::p.ai::perplexity ai
+::fc::fact check -
+
+
+; CC statement password
+:*:ccpass::
+{
+    Send "ASHU2605"
+    return
+}
+
+; :*:hdfccc::
+; :*:pnbcc::
+; :*:yescc::
+; :*:federalcc::
+
+; Reddit top posts of the week
+::tw::
+{
+    Send "top/?t=week{Enter}"
+    Return
+}
+
+#HotIf WinActive("ahk_exe firefox.exe")
+{
+    ::cric::
+    {
+        Send "https://www.cricbuzz.com/{Enter}"
+        return
+    }
+    ::yt::
+    {
+        Send "https://www.youtube.com/{Enter}"
+        Return
+    }
+    ::ddg::
+    {
+        Send "https://duckduckgo.com/{Enter}"
+        Return
+    }
+    ::gh::
+    {
+        Send "https://github.com/notifications{Enter}"
+        Return
+    }
+
+    ::ghrepo::
+    {
+        Send "https://github.com/a-rout?tab=repositories{Enter}"
+        Return
+    }
+
+    ::tt::
+    {
+        Send "https://x.com/home{Enter}"
+        return
+    }
+
+    ::discord::
+    {
+        Send "https://discord.com/channels/@me{Enter}"
+        Return
+    }
+}
+#HotIf
+
+; Open Twitter lists
+!x::
+{
+    Run "firefox.exe " "https://twitter.com/i/lists/1719577486097621000"
+    Run "https://twitter.com/i/lists/1688973258027110693"
+    Run "https://x.com/i/lists/1791724551111377285"
+    Return
+}
+
+; Open other firefox profile
+!c::
+{
+    Run "firefox.exe " "about:profiles"
+    Sleep 500
+
+    if WinExist("About Profiles — Mozilla Firefox")
+        WinActivate()
+
+    Sleep 500
+
+    If WinWaitActive("About Profiles — Mozilla Firefox")
+    {
+        MouseClick "left", 1227, 346
+        Sleep 100
+        SendInput "{TAB 12}"
+        Sleep 100
+        SendInput "{Enter}"
+    }
+    Return
+}
+
+; Ctrl+Win+S
+; Open Windows startup folder
+^#s:: Run("shell:startup")
+
+::ahkey::AutoHotkey
+::ahkdoc::
+{
+    Send "https://www.autohotkey.com/docs/v2/{Enter}"
+    return
+}
+
 ::ty::Thank you
 ::gm::Good morning
 ::ga::Good afternoon
 ::ge::Good evening
 ::oss::Open source software
+::gf::girlfriend
 
-;----------------------------------------------------------------------------
-; Personal/Work Info
-;----------------------------------------------------------------------------
-
-:*:@@@::xxx@hcltech.com
-:*:slno::865873333
-::1q::EXT-ASH333
-::perplexityai::perplexity.u333s.com
-::adminid::.\\ITDTPADMIN
-
-;----------------------------------------------------------------------------
-; Signatures & Formatting
-;----------------------------------------------------------------------------
-
-:*:br,::
-(
-    Thank you!
-    
-    Best Regards,
-    Ashutosh
-)
-
-:*:dash50::------------------------------------------------------------------------------------------------------------------------
-:*:us50::____________________________________________________________________________________________________
 
 ;============================================================================
-; END OF SCRIPT
+; Dash Maker - Type "dash" + character + number to repeat that character
+; Examples: dash-10 → ----------, dash=5 → =====, dash#20 → ####################
+; Supported: - = # * ~ + x
+; End input with: Space, Enter, or Tab
 ;============================================================================
 
+global MAX_REPEAT := 200  ; Maximum repetitions allowed
+
+; Register hotstrings for each character
+for item in ['-', '=', '#', '*', '~', '+', 'x']
+    HotString(':*:dash' item, StartDashCapture.Bind())
+
+StartDashCapture(*) {
+    global thisString := ""
+    global dashInputHook := InputHook('I2')
+
+    dashInputHook.OnChar := OnDashChar
+    dashInputHook.OnKeyUp := OnDashEnd
+    dashInputHook.KeyOpt('{Space}{Enter}{Tab}', '+N')  ; End keys
+    dashInputHook.Start()
+}
+
+OnDashChar(ih, char) {
+    global thisString .= char
+}
+
+OnDashEnd(ih, vk, sc) {
+    global thisString, MAX_REPEAT
+
+    ; Get the character from the hotstring (e.g., "dash-" → "-")
+    dashChar := '{' SubStr(A_ThisHotkey, -1) '}'
+
+    ; Build output based on input
+    if (IsNumber(thisString) && thisString > 0 && thisString <= MAX_REPEAT) {
+        output := ""
+        Loop thisString
+            output .= dashChar
+    } else {
+        ; Not a valid number, output original text
+        output := "dash" dashChar thisString
+    }
+
+    SendInput(output)
+    ih.Stop()
+    thisString := ""
+}
 
 
+; Set window to always on top
+; Ctrl + Space
+; ^space::
+; {
+;     WinSetAlwaysOnTop -1, "A"
+; }
+
+; Send Name
+!n::
+{
+    Send "Ashutosh{TAB}Rout{TAB}"
+    return
+}
+
+; Workdate range: yesterday to today
+^!d::
+{
+    yDay := A_Now
+
+    ; Calculate the previous working date
+    if (A_WDay = 1)
+        yDay := DateAdd(yDay, -2, "days")
+    else if (A_WDay = 2)
+        yDay := DateAdd(yDay, -3, "days")
+    else
+        yDay := DateAdd(yDay, -1, "days")
+
+    yDay := FormatTime(yDay, "dd.MM.yyyy")
+    tDay := FormatTime(A_Now, "dd.MM.yyyy")
+
+    ; Delete the existing date range and fill new one
+    Send "{BS 24}" yDay " to " tDay
+    return
+}
+
+; Current Date
+::dt::
+{
+    Send FormatTime(A_Now, "dd.MM.yyyy hh:mm tt")
+    return
+}
+
+; Shortcut to open Subtitle window in VLC
+#HotIf WinActive("ahk_exe vlc.exe")
+{
+    ; Open VLC subtitle window
+    #Space::
+    {
+        Send "!ts"
+        Return
+    }
+}
+#HotIf
 
 
+; NumLock always enabled - ALways keep it in the last
+SetNumlockState("AlwaysOn")
+return
