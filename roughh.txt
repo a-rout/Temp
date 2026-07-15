@@ -1,887 +1,92 @@
-#Requires AutoHotkey v2.0
-#SingleInstance Force
-
-Persistent
-SetTitleMatchMode 2
-SendMode "Input"
-
-#Warn All
-#MaxThreadsBuffer true
-
-; Force immediate keyboard hook installation to prevent startup delays
-InstallKeybdHook(true, true)
-
 ; =============================================================================
-; AUTOCOMPLETE v3 - Enhanced Edition by arout
+; Brightness Control - Adjust screen brightness via volume knob
 ; =============================================================================
-; An intelligent autocomplete system with learning capabilities,
-; typo tolerance, and enhanced keyboard navigation.
-;
-; Features:
-;   - Frequency-based learning
-;   - Typo tolerance (Levenshtein distance)
-;   - Improved scoring with consecutive match bonus
-;   - Application exclusions
-;   - Enhanced keyboard navigation
+; Adjusts display brightness using the AJAZZ AK820 (or similar) volume knob
+; while holding Left Shift. Supports both laptop displays (WMI) and external
+; monitors (DDC/CI via Dxva2.dll).
 ;
 ; Hotkeys:
-;   Tab / Enter          Complete with selected word
-;   Up / Down            Navigate suggestions
-;   PgUp / PgDn          Jump 5 items
-;   Alt+1 to Alt+0       Quick select 1st-10th item
-;   Ctrl+Alt+A           Toggle autocomplete on/off
-;   Escape               Dismiss suggestions
+;   LShift + Volume Knob Up     Increase brightness by 5%
+;   LShift + Volume Knob Down   Decrease brightness by 5%
 ; =============================================================================
+
+#Requires AutoHotkey v2.0
+#SingleInstance Force
+#NoTrayIcon
 
 ; =============================================================================
 ; CONFIGURATION
 ; =============================================================================
 
-class Config {
-    ; -------------------------------------------------------------------------
-    ; Layout Constants (UPPER_SNAKE_CASE = do not modify at runtime)
-    ; -------------------------------------------------------------------------
-    static ROW_HEIGHT := 21
-    static BOX_PADDING := 8
-    static WIDTH_PADDING := 30
-    static LISTBOX_SIDE_INSET := 4
-    static PAGE_SCROLL_SIZE := 5
-
-    ; Colors
-    static POPUP_BG_COLOR := "1a1a2e"
-    static POPUP_TEXT_COLOR := "EEEEEE"
-
-    ; Tray icon indices (shell32.dll)
-    static ICON_ENABLED := 278
-    static ICON_DISABLED := 132
-
-    ; -------------------------------------------------------------------------
-    ; File Paths
-    ; -------------------------------------------------------------------------
-    static WordListFile := A_ScriptDir . "\NameList.txt"
-    static SettingsFile := A_ScriptDir . "\Settings.ini"
-    static StatsFile := A_ScriptDir . "\WordStats.ini"
-
-    ; -------------------------------------------------------------------------
-    ; User Settings (loaded from / saved to INI)
-    ; -------------------------------------------------------------------------
-    static MaxResults := 3
-    static OffsetX := 0
-    static OffsetY := 20
-    static ShowLength := 2
-    static CorrectCase := true
-    static EnableLearning := true
-    static TypoTolerance := 1
-    static ExcludedApps := "cmd.exe,powershell.exe,WindowsTerminal.exe,ConEmu64.exe"
-
-    ; -------------------------------------------------------------------------
-    ; Key Lists
-    ; -------------------------------------------------------------------------
-    static NormalKeyList := "a`nb`nc`nd`ne`nf`ng`nh`ni`nj`nk`nl`nm`nn`no`np`nq`nr`ns`nt`nu`nv`nw`nx`ny`nz"
-    static NumberKeyList := "1`n2`n3`n4`n5`n6`n7`n8`n9`n0"
-    static OtherKeyList := "'`n-"
-    static ResetKeyList := "Esc`nSpace`nHome`nPGUP`nPGDN`nEnd`nLeft`nRight`nRButton`nMButton`n,`n.`n/`n[`n]`n;`n\`n=`n```n`""
-    static TriggerKeyList := "Tab`nEnter"
-
-    ; -------------------------------------------------------------------------
-    ; Methods
-    ; -------------------------------------------------------------------------
-
-    /**
-     * Safely parse an integer from a value, returning a default on failure
-     * @param {Any} val The value to parse
-     * @param {Integer} default Fallback value if parsing fails
-     * @returns {Integer} The parsed integer or the default
-     */
-    static SafeInt(val, default := 0) {
-        try return Integer(val)
-        catch
-            return default
-    }
-
-    /**
-     * Load all settings from the INI file, falling back to class defaults
-     */
-    static Load() {
-        sf := this.SettingsFile
-
-        this.MaxResults := Max(1, Min(100, this.SafeInt(IniRead(sf, "Settings", "MaxResults", this.MaxResults), this.MaxResults)))
-        this.ShowLength := Max(1, Min(10, this.SafeInt(IniRead(sf, "Settings", "ShowLength", this.ShowLength), this.ShowLength)))
-        this.CorrectCase := !!this.SafeInt(IniRead(sf, "Settings", "CorrectCase", this.CorrectCase ? 1 : 0), this.CorrectCase)
-        this.EnableLearning := !!this.SafeInt(IniRead(sf, "Settings", "EnableLearning", this.EnableLearning ? 1 : 0), this.EnableLearning)
-        this.TypoTolerance := Max(0, Min(3, this.SafeInt(IniRead(sf, "Settings", "TypoTolerance", this.TypoTolerance), this.TypoTolerance)))
-        this.ExcludedApps := IniRead(sf, "Settings", "ExcludedApps", this.ExcludedApps)
-
-        this.NormalKeyList := URLDecode(IniRead(sf, "Keys", "NormalKeyList", URLEncode(this.NormalKeyList)))
-        this.NumberKeyList := URLDecode(IniRead(sf, "Keys", "NumberKeyList", URLEncode(this.NumberKeyList)))
-        this.OtherKeyList := URLDecode(IniRead(sf, "Keys", "OtherKeyList", URLEncode(this.OtherKeyList)))
-        this.ResetKeyList := URLDecode(IniRead(sf, "Keys", "ResetKeyList", URLEncode(this.ResetKeyList)))
-        this.TriggerKeyList := URLDecode(IniRead(sf, "Keys", "TriggerKeyList", URLEncode(this.TriggerKeyList)))
-    }
-
-    /**
-     * Save all current settings to the INI file
-     */
-    static Save() {
-        sf := this.SettingsFile
-
-        IniWrite(this.MaxResults, sf, "Settings", "MaxResults")
-        IniWrite(this.ShowLength, sf, "Settings", "ShowLength")
-        IniWrite(this.CorrectCase ? 1 : 0, sf, "Settings", "CorrectCase")
-        IniWrite(this.EnableLearning ? 1 : 0, sf, "Settings", "EnableLearning")
-        IniWrite(this.TypoTolerance, sf, "Settings", "TypoTolerance")
-        IniWrite(this.ExcludedApps, sf, "Settings", "ExcludedApps")
-
-        IniWrite(URLEncode(this.NormalKeyList), sf, "Keys", "NormalKeyList")
-        IniWrite(URLEncode(this.NumberKeyList), sf, "Keys", "NumberKeyList")
-        IniWrite(URLEncode(this.OtherKeyList), sf, "Keys", "OtherKeyList")
-        IniWrite(URLEncode(this.ResetKeyList), sf, "Keys", "ResetKeyList")
-        IniWrite(URLEncode(this.TriggerKeyList), sf, "Keys", "TriggerKeyList")
-    }
-}
+BRIGHTNESS_STEP := 5          ; Brightness adjustment per knob tick (0-100)
+POLL_INTERVAL := 10           ; LShift polling interval in ms
+OSD_DISPLAY_TIME := 2000      ; Tooltip display duration in ms
 
 ; =============================================================================
-; GLOBAL VARIABLES / INTERNAL STATE
+; GLOBAL VARIABLES
 ; =============================================================================
 
-global wordList := ""
-global wordFrequency := Map()
-
-global currentWord := ""
-global matchList := ""
-global matchListCount := 0
-global hWindow := 0
-global guiSuggestions := 0
-global lstMatched := 0
-global autocompleteEnabled := true
-
-global screenWidth := SysGet(78)
-global screenHeight := SysGet(79)
+global shiftState := 0
 
 ; =============================================================================
 ; INITIALIZATION
 ; =============================================================================
 
-CoordMode("Caret")
-SetKeyDelay(0)
+; Install keyboard hook for reliable modifier tracking
+; Required because AJAZZ AK820 knob resets modifier state on media key events
+InstallKeybdHook()
 
-; Load settings from INI
-Config.Load()
+; Poll LShift state independently of knob events
+SetTimer(PollShift, POLL_INTERVAL)
 
-; Read and prepare word list
-try {
-    wordList := FileRead(Config.WordListFile, "UTF-8-RAW")
-} catch {
-    try wordList := FileRead(Config.WordListFile)
-    catch {
-        wordList := ""
-        ToolTip("Warning: Could not read " . Config.WordListFile)
-        SetTimer(() => ToolTip(), -3000)
-    }
+PollShift() {
+    global shiftState
+    shiftState := GetKeyState("LShift", "P")
 }
-wordList := PrepareWordList(wordList)
-
-; Load word frequency stats
-LoadWordStats()
-
-; Show startup notification
-TrayTip("Autocomplete v3 Active`nCtrl+Alt+A to toggle", "Autocomplete", 1)
-
-; =============================================================================
-; TRAY MENU
-; =============================================================================
-
-A_TrayMenu.Delete()
-A_TrayMenu.ClickCount := 1
-A_TrayMenu.Add("&Settings", ShowSettingsMenu)
-A_TrayMenu.Add("&Toggle (Ctrl+Alt+A)", ToggleAutocompleteMenu)
-A_TrayMenu.Add()
-A_TrayMenu.Add("E&xit", ExitScript)
-A_TrayMenu.Default := "&Settings"
 
 ; =============================================================================
 ; HOTKEYS
 ; =============================================================================
 
-SetupHotkeys()
-CreateSuggestionsGui()
-OnExit(ExitHandler)
-
-; -----------------------------------------------------------------------------
-; Hotkey Setup
-; -----------------------------------------------------------------------------
-
-/**
- * Register all keyboard hotkeys from the configured key lists
- */
-SetupHotkeys() {
-    ; Normal keys (a-z)
-    Loop Parse, Config.NormalKeyList, "`n" {
-        try {
-            Hotkey("~" . A_LoopField, NormalKey)
-            Hotkey("~+" . A_LoopField, ShiftedKey)
-        }
-    }
-
-    ; Number keys
-    Loop Parse, Config.NumberKeyList, "`n" {
-        try {
-            Hotkey("~" . A_LoopField, NormalKey)
-            Hotkey("~Numpad" . A_LoopField, NumpadKey)
-        }
-    }
-
-    ; Other keys (apostrophe, hyphen, etc.)
-    Loop Parse, Config.OtherKeyList, "`n" {
-        try Hotkey("~" . A_LoopField, NormalKey)
-    }
-
-    ; Reset keys (dismiss suggestions and clear current word)
-    Loop Parse, Config.ResetKeyList, "`n" {
-        try Hotkey("~*" . A_LoopField, ResetWord)
-    }
-
-    ; Trigger keys — context-sensitive (only when suggestions popup exists)
-    HotIfWinExist("AutoComplete ahk_class AutoHotkeyGUI")
-    Loop Parse, Config.TriggerKeyList, "`n" {
-        try Hotkey(A_LoopField, CompleteWordHotkey)
-    }
-    HotIf()
-
-    ; Backspace hotkey (always active)
-    Hotkey("~BackSpace", BackspaceKey)
-
-    ; Context-sensitive hotkeys for when autocomplete popup is visible
-    HotIfWinExist("AutoComplete ahk_class AutoHotkeyGUI")
-    Hotkey("~LButton", LeftButtonClick)
-    Hotkey("Up", UpKey)
-    Hotkey("Down", DownKey)
-    Hotkey("PgUp", PageUpKey)
-    Hotkey("PgDn", PageDownKey)
-    Hotkey("!1", AltNumberKey)
-    Hotkey("!2", AltNumberKey)
-    Hotkey("!3", AltNumberKey)
-    Hotkey("!4", AltNumberKey)
-    Hotkey("!5", AltNumberKey)
-    Hotkey("!6", AltNumberKey)
-    Hotkey("!7", AltNumberKey)
-    Hotkey("!8", AltNumberKey)
-    Hotkey("!9", AltNumberKey)
-    Hotkey("!0", AltNumberKey)
-    HotIf()
-
-    ; Ctrl+Alt+A - Toggle autocomplete on/off
-    Hotkey("^!a", ToggleAutocompleteHotkey)
-}
-
-; -----------------------------------------------------------------------------
-; Hotkey Handlers
-; -----------------------------------------------------------------------------
-
-/**
- * Handle a normal (unshifted) key press, appending the character to the current word
- * @param {String} thisHotkey The hotkey string (e.g., "~a")
- */
-NormalKey(thisHotkey) {
-    global currentWord, autocompleteEnabled
-    if !autocompleteEnabled || IsExcludedApp()
-        return
-    currentWord .= SubStr(thisHotkey, 2)
-    Suggest()
-}
-
-/**
- * Handle a shifted key press, appending the uppercase character
- * @param {String} thisHotkey The hotkey string (e.g., "~+a")
- */
-ShiftedKey(thisHotkey) {
-    global currentWord, autocompleteEnabled
-    if !autocompleteEnabled || IsExcludedApp()
-        return
-    char := SubStr(thisHotkey, 3)
-    currentWord .= StrUpper(char)
-    Suggest()
-}
-
-/**
- * Handle a numpad key press, appending the digit
- * @param {String} thisHotkey The hotkey string (e.g., "~Numpad1")
- */
-NumpadKey(thisHotkey) {
-    global currentWord, autocompleteEnabled
-    if !autocompleteEnabled || IsExcludedApp()
-        return
-    currentWord .= SubStr(thisHotkey, 8)
-    Suggest()
-}
-
-/**
- * Handle backspace, removing the last character from the current word
- * @param {String} thisHotkey The hotkey string
- */
-BackspaceKey(thisHotkey) {
-    global currentWord, autocompleteEnabled
-    if !autocompleteEnabled || IsExcludedApp()
-        return
-    currentWord := SubStr(currentWord, 1, -1)
-    Suggest()
-}
-
-/**
- * Reset the current word and hide the suggestions popup
- * @param {String} thisHotkey Optional hotkey string (unused, required by callback signature)
- */
-ResetWord(thisHotkey := "") {
-    global currentWord, guiSuggestions
-    currentWord := ""
-    guiSuggestions.Hide()
-}
-
-/**
- * Handle left mouse click — dismiss suggestions if clicking outside the popup
- * @param {String} thisHotkey The hotkey string
- */
-LeftButtonClick(thisHotkey) {
-    global hWindow
-    MouseGetPos(, , &winUnderMouse)
-    if (winUnderMouse != hWindow)
-        ResetWord()
-}
-
-/**
- * Navigate one item up in the suggestions list
- * @param {String} thisHotkey The hotkey string
- */
-UpKey(thisHotkey) {
-    global lstMatched
-    currentValue := lstMatched.Value
-    if (currentValue > 1)
-        lstMatched.Choose(currentValue - 1)
-}
-
-/**
- * Navigate one item down in the suggestions list
- * @param {String} thisHotkey The hotkey string
- */
-DownKey(thisHotkey) {
-    global lstMatched, matchListCount
-    currentValue := lstMatched.Value
-    if (currentValue < matchListCount)
-        lstMatched.Choose(currentValue + 1)
-}
-
-/**
- * Jump up by PAGE_SCROLL_SIZE items in the suggestions list
- * @param {String} thisHotkey The hotkey string
- */
-PageUpKey(thisHotkey) {
-    global lstMatched
-    currentValue := lstMatched.Value
-    newValue := Max(1, currentValue - Config.PAGE_SCROLL_SIZE)
-    lstMatched.Choose(newValue)
-}
-
-/**
- * Jump down by PAGE_SCROLL_SIZE items in the suggestions list
- * @param {String} thisHotkey The hotkey string
- */
-PageDownKey(thisHotkey) {
-    global lstMatched, matchListCount
-    currentValue := lstMatched.Value
-    newValue := Min(matchListCount, currentValue + Config.PAGE_SCROLL_SIZE)
-    lstMatched.Choose(newValue)
-}
-
-/**
- * Quick-select an item by its Alt+number shortcut (Alt+1 through Alt+0)
- * @param {String} thisHotkey The hotkey string (e.g., "!1")
- */
-AltNumberKey(thisHotkey) {
-    global lstMatched
-    KeyWait("Alt")
-    key := SubStr(thisHotkey, 2, 1)
-    lstMatched.Choose(key = "0" ? 10 : key)
-    CompleteWordHotkey("")
-}
-
-/**
- * Hotkey wrapper for CompleteWord (called by Tab/Enter)
- * @param {String} thisHotkey The hotkey string
- */
-CompleteWordHotkey(thisHotkey) {
-    CompleteWord()
-}
-
-/**
- * Hotkey wrapper for ToggleAutocomplete (Ctrl+Alt+A)
- * @param {String} thisHotkey The hotkey string
- */
-ToggleAutocompleteHotkey(thisHotkey) {
-    ToggleAutocomplete()
-}
-
-/**
- * Tray menu wrapper for ToggleAutocomplete
- */
-ToggleAutocompleteMenu(itemName, itemPos, myMenu) {
-    ToggleAutocomplete()
-}
-
-; =============================================================================
-; GUI FUNCTIONS
-; =============================================================================
-
-; -----------------------------------------------------------------------------
-; Suggestions Popup
-; -----------------------------------------------------------------------------
-
-/**
- * Create the always-on-top suggestions popup window with dark theme
- * Uses Courier New (monospaced) for aligned numbered entries
- */
-CreateSuggestionsGui() {
-    global guiSuggestions, lstMatched, hWindow
-
-    ; DWM Window Attribute constants
-    DWMWA_NCRENDERING_POLICY := 2
-    DWMWA_WINDOW_CORNER_PREFERENCE := 33
-    DWMWA_BORDER_COLOR := 34
-    DWMWCP_ROUND := 2
-    DWMWA_COLOR_NONE := 0xFFFFFFFE
-    DWMNCRP_ENABLED := 2
-
-    guiSuggestions := Gui("+AlwaysOnTop -Caption +ToolWindow", "AutoComplete")
-    guiSuggestions.SetFont("s10", "Courier New")
-    guiSuggestions.BackColor := Config.POPUP_BG_COLOR
-
-    defaultHeight := Config.ROW_HEIGHT * 3 + Config.BOX_PADDING
-    lstMatched := guiSuggestions.Add("ListBox"
-        , "x2 y2 h" . defaultHeight
-        . " -Border -E0x200 0x100 vMatched AltSubmit"
-        . " Background" . Config.POPUP_BG_COLOR
-        . " c" . Config.POPUP_TEXT_COLOR)
-    lstMatched.OnEvent("DoubleClick", CompleteWord)
-
-    hWindow := guiSuggestions.Hwnd
-
-    ; Windows 11 DWM: rounded corners
-    DllCall("dwmapi\DwmSetWindowAttribute"
-        , "UPtr", hWindow
-        , "UInt", DWMWA_WINDOW_CORNER_PREFERENCE
-        , "UInt*", DWMWCP_ROUND
-        , "UInt", 4)
-
-    ; Enable non-client rendering for drop shadow
-    DllCall("dwmapi\DwmSetWindowAttribute"
-        , "UPtr", hWindow
-        , "UInt", DWMWA_NCRENDERING_POLICY
-        , "UInt*", DWMNCRP_ENABLED
-        , "UInt", 4)
-
-    ; Remove the 1px white accent border Windows 11 draws around rounded windows
-    DllCall("dwmapi\DwmSetWindowAttribute"
-        , "UPtr", hWindow
-        , "UInt", DWMWA_BORDER_COLOR
-        , "UInt*", DWMWA_COLOR_NONE
-        , "UInt", 4)
-
-    guiSuggestions.Show("h" . defaultHeight . " Hide")
-}
-
-; -----------------------------------------------------------------------------
-; Settings Window (class-based)
-; -----------------------------------------------------------------------------
-
-/**
- * Tray menu callback to open or focus the Settings window
- */
-ShowSettingsMenu(itemName, itemPos, myMenu) {
-    SettingsWindow.Show()
-}
-
-/**
- * Class-based Settings GUI encapsulating all state, controls, and callbacks.
- * Provides add/remove word management, setting controls, and stats clearing.
- */
-class SettingsWindow {
-    static instance := 0
-
-    /**
-     * Show the settings window, creating it if it doesn't exist
-     */
-    static Show() {
-        if this.instance {
-            try {
-                this.instance.gui.Show()
-                return
-            } catch {
-                ; GUI was destroyed externally; reset and recreate
-                this.instance := 0
-            }
-        }
-        this.instance := SettingsWindow()
-    }
-
-    /**
-     * Build and display the settings GUI
-     */
-    __New() {
-        this.gui := Gui("+ToolWindow +AlwaysOnTop", "Autocomplete Settings")
-        this.gui.BackColor := "White"
-        this.gui.OnEvent("Close", ObjBindMethod(this, "OnClose"))
-        this.gui.OnEvent("Escape", ObjBindMethod(this, "OnClose"))
-
-        this.BuildLayout()
-        this.PopulateWordList()
-        this.gui.Show("w440 h420")
-    }
-
-    /**
-     * Build all GUI controls using relative positioning.
-     * Layout: Settings GroupBox (compact grid) → Word List GroupBox
-     */
-    BuildLayout() {
-        CONTENT_W := 408   ; inner content width (440 - 2*16 margin)
-        INNER_W := CONTENT_W - 24  ; usable width inside GroupBox (12px pad each side)
-        BTN_W := (INNER_W - 4) // 2  ; two equal buttons with 4px gap between
-
-        ; --- Settings GroupBox ---
-        try this.gui.SetFont("s10 c333333 Norm", "Segoe UI Variable")
-        catch
-            this.gui.SetFont("s10 c333333 Norm", "Segoe UI")
-
-        this.gui.Add("GroupBox", "xm w" . CONTENT_W . " h168 Section", "Settings")
-
-        ; Row 1: Result Limit + Trigger Length
-        this.gui.Add("Text", "xs+12 ys+24 w100 h23 +0x200", "Result Limit:")
-        this.gui.Add("Edit", "x+4 yp w52 h23 Right Number")
-        this.gui.Add("UpDown", "Range1-100 vMaxResultsCtrl", Config.MaxResults)
-
-        this.gui.Add("Text", "x+16 yp w104 h23 +0x200", "Trigger Length:")
-        this.gui.Add("Edit", "x+4 yp w52 h23 Right Number")
-        this.gui.Add("UpDown", "Range1-10 vShowLengthCtrl", Config.ShowLength)
-
-        ; Row 2: Typo Tolerance + Case Correction
-        this.gui.Add("Text", "xs+12 y+8 w100 h23 +0x200", "Typo Tolerance:")
-        this.gui.Add("Edit", "x+4 yp w52 h23 Right Number")
-        this.gui.Add("UpDown", "Range0-3 vTypoToleranceCtrl", Config.TypoTolerance)
-
-        this.gui.Add("Checkbox", "x+16 yp w200 h23 vCorrectCaseCtrl Checked" . (Config.CorrectCase ? 1 : 0), "Case Correction")
-
-        ; Row 3: Enable Learning
-        this.gui.Add("Checkbox", "xs+12 y+8 w" . INNER_W . " h23 vEnableLearningCtrl Checked" . (Config.EnableLearning ? 1 : 0), "Enable Learning (Frequency)")
-
-        ; Row 4: Excluded Apps (label above edit for full-width field)
-        this.gui.Add("Text", "xs+12 y+6 w100 h16", "Excluded Apps:")
-        this.gui.Add("Edit", "xs+12 y+2 w" . INNER_W . " h23 vExcludedAppsCtrl", Config.ExcludedApps)
-
-        ; --- Word List GroupBox ---
-        ; Height calc: 24(top) + 25(edit) + 4 + 150(LV) + 4 + 28(btn) + 8(bottom) = 243
-        try this.gui.SetFont("s10 c333333 Norm", "Segoe UI Variable")
-        catch
-            this.gui.SetFont("s10 c333333 Norm", "Segoe UI")
-
-        this.gui.Add("GroupBox", "xm y+8 w" . CONTENT_W . " h243 Section", "Word List")
-
-        ; Add word row
-        this.gui.Add("Edit", "xs+12 ys+24 w" . (INNER_W - 64) . " h25 vNewWord")
-        btnAdd := this.gui.Add("Button", "x+4 yp w60 h25", "&Add")
-        btnAdd.OnEvent("Click", ObjBindMethod(this, "OnAddWord"))
-
-        ; Word list view
-        try this.gui.SetFont("s9", "Consolas")
-        catch
-            this.gui.SetFont("s9", "Courier New")
-        this.wordsLV := this.gui.Add("ListView", "xs+12 y+4 w" . INNER_W . " h150 -Hdr vWords", ["Words"])
-
-        ; Buttons row (equal width, properly inside the GroupBox)
-        try this.gui.SetFont("s10 c333333 Norm", "Segoe UI Variable")
-        catch
-            this.gui.SetFont("s10 c333333 Norm", "Segoe UI")
-        btnRemove := this.gui.Add("Button", "xs+12 y+4 w" . BTN_W . " h28", "&Remove Selected")
-        btnRemove.OnEvent("Click", ObjBindMethod(this, "OnRemoveWord"))
-
-        btnClear := this.gui.Add("Button", "x+4 yp w" . BTN_W . " h28", "&Clear Stats")
-        btnClear.OnEvent("Click", ObjBindMethod(this, "OnClearStats"))
-    }
-
-    /**
-     * Populate the word list ListView with current words and frequency counts
-     */
-    PopulateWordList() {
-        global wordList
-        this.wordsLV.Opt("-Redraw")
-        Loop Parse, wordList, "`n" {
-            if (A_LoopField = "")
-                continue
-            freq := GetWordFrequency(A_LoopField)
-            freqStr := freq > 0 ? " (" . freq . ")" : ""
-            this.wordsLV.Add("", A_LoopField . freqStr)
-        }
-        ; Fill column to full ListView width (eliminates empty space to the right)
-        this.wordsLV.ModifyCol(1, "AutoHdr")
-        this.wordsLV.Opt("+Redraw")
-    }
-
-    /**
-     * Add a new word to the list from the input field
-     * @param {Object} guiCtrlObj The button control
-     * @param {Any} info Event info
-     */
-    OnAddWord(guiCtrlObj, info) {
-        global wordList
-
-        newWordValue := Trim(this.gui["NewWord"].Value)
-        if (newWordValue = "")
-            return
-
-        ; Check for duplicates (case-sensitive)
-        if InStr("`n" . wordList . "`n", "`n" . newWordValue . "`n") {
-            ToolTip("'" . newWordValue . "' is already in the list")
-            SetTimer(() => ToolTip(), -1500)
-            return
-        }
-
-        index := this.wordsLV.Add("Select Focus", newWordValue)
-        this.wordsLV.Modify(index, "Vis")
-        wordList .= "`n" . newWordValue
-        this.gui["NewWord"].Value := ""
-    }
-
-    /**
-     * Remove all selected words from the list.
-     * Deletes rows bottom-up to preserve indices, then rebuilds the word list.
-     * @param {Object} guiCtrlObj The button control
-     * @param {Any} info Event info
-     */
-    OnRemoveWord(guiCtrlObj, info) {
-        global wordList
-
-        ; Collect selected row indices
-        rows := []
-        rowNum := 0
-        while (rowNum := this.wordsLV.GetNext(rowNum))
-            rows.Push(rowNum)
-
-        if (rows.Length = 0)
-            return
-
-        ; Delete bottom-up to avoid index shifting
-        this.wordsLV.Opt("-Redraw")
-        i := rows.Length
-        while (i >= 1) {
-            this.wordsLV.Delete(rows[i])
-            i--
-        }
-        this.wordsLV.Opt("+Redraw")
-
-        ; Rebuild wordList from remaining ListView entries
-        newList := ""
-        Loop this.wordsLV.GetCount() {
-            rawText := this.wordsLV.GetText(A_Index)
-            ; Strip " (N)" frequency display suffix
-            rawText := RegExReplace(rawText, " \(\d+\)$")
-            newList .= (newList != "" ? "`n" : "") . rawText
-        }
-        wordList := newList
-    }
-
-    /**
-     * Clear all learning statistics after user confirmation
-     * @param {Object} guiCtrlObj The button control
-     * @param {Any} info Event info
-     */
-    OnClearStats(guiCtrlObj, info) {
-        global wordFrequency, wordList
-
-        this.gui.Opt("+OwnDialogs")
-        result := MsgBox("Clear all learning statistics?", "Confirm", 4132)
-        if (result = "Yes") {
-            wordFrequency := Map()
-            try FileDelete(Config.StatsFile)
-
-            ; Refresh ListView to remove stale frequency counts
-            this.wordsLV.Opt("-Redraw")
-            this.wordsLV.Delete()
-            Loop Parse, wordList, "`n" {
-                if (A_LoopField != "")
-                    this.wordsLV.Add("", A_LoopField)
-            }
-            this.wordsLV.Opt("+Redraw")
-
-            ToolTip("Statistics cleared!")
-            SetTimer(() => ToolTip(), -1500)
-        }
-    }
-
-    /**
-     * Save settings and word list when the settings window is closed
-     * @param {Object} guiObj The GUI object
-     */
-    OnClose(guiObj) {
-        global wordList
-
-        ; Read current values from controls
-        Config.MaxResults := Max(1, Min(100, Config.SafeInt(this.gui["MaxResultsCtrl"].Value, Config.MaxResults)))
-        Config.ShowLength := Max(1, Min(10, Config.SafeInt(this.gui["ShowLengthCtrl"].Value, Config.ShowLength)))
-        Config.CorrectCase := !!this.gui["CorrectCaseCtrl"].Value
-        Config.EnableLearning := !!this.gui["EnableLearningCtrl"].Value
-        Config.TypoTolerance := Max(0, Min(3, Config.SafeInt(this.gui["TypoToleranceCtrl"].Value, Config.TypoTolerance)))
-        Config.ExcludedApps := this.gui["ExcludedAppsCtrl"].Value
-
-        ; Persist word list changes immediately so they survive a crash
-        AtomicFileWrite(wordList, Config.WordListFile)
-
-        this.gui.Destroy()
-        SettingsWindow.instance := 0
-    }
-}
-
-; =============================================================================
-; PUBLIC FUNCTIONS
-; =============================================================================
-
-; -----------------------------------------------------------------------------
-; Suggestion Engine
-; -----------------------------------------------------------------------------
-
-/**
- * Show or hide the suggestions popup based on the current word.
- * Calculates position near the caret (or mouse fallback) and ensures
- * the popup stays within screen bounds.
- */
-Suggest() {
-    global currentWord, matchList, matchListCount, guiSuggestions, lstMatched, wordList
-    global screenWidth, screenHeight
-
-    if (StrLen(currentWord) < Config.ShowLength) {
-        guiSuggestions.Hide()
-        return
-    }
-
-    matchList := SuggestWord(currentWord, wordList)
-
-    if (matchList = "") {
-        matchListCount := 0
-        guiSuggestions.Hide()
-        return
-    }
-
-    ; Limit the number of results
-    position := InStr(matchList, "`n", true, 1, Config.MaxResults)
-    if position
-        matchList := SubStr(matchList, 1, position - 1)
-
-    ; Build numbered display list and measure widths
-    maxWidth := 0
-    displayList := []
-    loopIndex := 0
-    Loop Parse, matchList, "`n" {
-        loopIndex++
-        entry := (loopIndex < 10 ? loopIndex . ". " : "   ") . A_LoopField
-        width := TextWidth(entry)
-        if (width > maxWidth)
-            maxWidth := width
-        displayList.Push(entry)
-    }
-    matchListCount := displayList.Length
-    winWidth := maxWidth + Config.WIDTH_PADDING
-    boxHeight := matchListCount * Config.ROW_HEIGHT + Config.BOX_PADDING
-
-    lstMatched.Delete()
-    for item in displayList
-        lstMatched.Add([item])
-    lstMatched.Choose(1)
-    lstMatched.Move(, , winWidth - Config.LISTBOX_SIDE_INSET, matchListCount * Config.ROW_HEIGHT + 4)
-
-    ; Calculate position — caret first, mouse fallback
-    hasCaret := CaretGetPos(&caretX, &caretY)
-    caretValid := hasCaret && caretX != "" && caretY != "" && !(caretX = 0 && caretY = 0)
-
-    if (caretValid) {
-        posX := caretX + Config.OffsetX
-        posY := caretY + Config.OffsetY
-    } else {
-        prevMouseCoord := A_CoordModeMouse
-        CoordMode("Mouse", "Screen")
-        MouseGetPos(&mouseX, &mouseY)
-        CoordMode("Mouse", prevMouseCoord)
-        posX := mouseX + Config.OffsetX
-        posY := mouseY + Config.OffsetY
-    }
-
-    ; Ensure popup stays within screen bounds
-    if (posX < 0)
-        posX := 0
-    if (posX + winWidth > screenWidth)
-        posX := screenWidth - winWidth
-    if (posY < 0)
-        posY := 0
-    if (posY + boxHeight > screenHeight)
-        posY := screenHeight - boxHeight
-
-    guiSuggestions.Show("x" . posX . " y" . posY . " w" . winWidth . " h" . boxHeight . " NoActivate")
-}
-
-; -----------------------------------------------------------------------------
-; Word Completion
-; -----------------------------------------------------------------------------
-
-/**
- * Complete the selected word from the suggestion list.
- * Called by Tab/Enter hotkey (no params) or ListBox DoubleClick (with params).
- * @param {Object} guiCtrlObj GUI control object (from double-click) or unset
- * @param {Integer} info Item position (from double-click) or unset
- */
-CompleteWord(guiCtrlObj := "", info := "") {
-    global currentWord, matchList, guiSuggestions, lstMatched
-
-    Critical("On")
-    guiSuggestions.Hide()
-
-    ; Retrieve the selected word
-    index := lstMatched.Value
-    if (index < 1) {
-        Critical("Off")
-        return
-    }
-
-    tempList := "`n" . matchList . "`n"
-    position := InStr(tempList, "`n", false, 1, index) + 1
-    newWord := SubStr(tempList, position, InStr(tempList, "`n", false, position) - position)
-
-    ; Track frequency
-    IncrementWordFrequency(newWord)
-
-    SendWord(currentWord, newWord, Config.CorrectCase)
-
-    ResetWord()
-    Critical("Off")
-}
-
-; -----------------------------------------------------------------------------
-; Toggle
-; -----------------------------------------------------------------------------
-
-/**
- * Toggle the autocomplete feature on or off, updating the tray icon
- */
-ToggleAutocomplete() {
-    global autocompleteEnabled, guiSuggestions, currentWord
-
-    autocompleteEnabled := !autocompleteEnabled
-    if !autocompleteEnabled
-        currentWord := ""
-    guiSuggestions.Hide()
-
-    status := autocompleteEnabled ? "Enabled" : "Disabled"
-    ToolTip("Autocomplete " . status)
-    SetTimer(() => ToolTip(), -1500)
-
-    if autocompleteEnabled
-        TraySetIcon("shell32.dll", Config.ICON_ENABLED)
+; InputLevel 1 prevents Send "{Volume_Up/Down}" from re-triggering these hotkeys
+#InputLevel 1
+
+; * prefix = fire even if modifiers are held (required for knob + LShift combo)
+*Volume_Up:: {
+    global shiftState
+    if shiftState
+        AdjustBrightness(BRIGHTNESS_STEP)
     else
-        TraySetIcon("shell32.dll", Config.ICON_DISABLED)
+        Send "{Volume_Up}"
+}
+
+*Volume_Down:: {
+    global shiftState
+    if shiftState
+        AdjustBrightness(-BRIGHTNESS_STEP)
+    else
+        Send "{Volume_Down}"
+}
+
+#InputLevel 0
+
+; =============================================================================
+; MAIN FUNCTIONS
+; =============================================================================
+
+; -----------------------------------------------------------------------------
+; AdjustBrightness - Set display brightness using DDC/CI or WMI fallback
+; -----------------------------------------------------------------------------
+; Tries DDC/CI first (external monitors), then falls back to WMI (laptop displays).
+; Amount: positive to increase, negative to decrease (clamped 0-100)
+; -----------------------------------------------------------------------------
+AdjustBrightness(Amount) {
+    ; Try DDC/CI first (works for external monitors)
+    if AdjustBrightnessDDC(Amount)
+        return
+
+    ; Fall back to WMI (works for laptop internal displays)
+    AdjustBrightnessWMI(Amount)
 }
 
 ; =============================================================================
@@ -889,470 +94,125 @@ ToggleAutocomplete() {
 ; =============================================================================
 
 ; -----------------------------------------------------------------------------
-; Word List Handling
+; AdjustBrightnessDDC - Control brightness via DDC/CI (Dxva2.dll)
 ; -----------------------------------------------------------------------------
-
-/**
- * Normalize a word list string: strip carriage returns, collapse blank lines, trim
- * @param {String} content Raw word list content
- * @returns {String} Cleaned word list with one word per line
- */
-PrepareWordList(content) {
-    if InStr(content, "`r")
-        content := StrReplace(content, "`r", "")
-    while InStr(content, "`n`n")
-        content := StrReplace(content, "`n`n", "`n")
-    content := Trim(content, "`n")
-    return content
-}
-
-/**
- * Load word frequency statistics from the stats INI file
- */
-LoadWordStats() {
-    global wordFrequency
-
+; Uses the Windows Physical Monitor API to control external monitor brightness.
+; Requires DDC/CI to be enabled in the monitor's OSD settings.
+; Returns: true if successful, false if no DDC/CI monitor found
+; -----------------------------------------------------------------------------
+AdjustBrightnessDDC(Amount) {
     try {
-        content := IniRead(Config.StatsFile, "Frequency")
-        Loop Parse, content, "`n" {
-            eqPos := InStr(A_LoopField, "=")
-            if eqPos {
-                key := SubStr(A_LoopField, 1, eqPos - 1)
-                val := SubStr(A_LoopField, eqPos + 1)
-                if IsInteger(val)
-                    wordFrequency[key] := Integer(val)
-            }
+        ; Get the primary monitor handle (point 0,0 = primary display)
+        ; MONITOR_DEFAULTTOPRIMARY = 1
+        hMonitor := DllCall("user32\MonitorFromPoint", "Int64", 0, "UInt", 1, "Ptr")
+        if !hMonitor
+            return false
+
+        ; Get number of physical monitors
+        numPhysical := 0
+        result := DllCall("dxva2\GetNumberOfPhysicalMonitorsFromHMONITOR"
+            , "Ptr", hMonitor
+            , "UInt*", &numPhysical)
+        if !result || !numPhysical
+            return false
+
+        ; PHYSICAL_MONITOR struct: Ptr handle + 128 WCHAR description
+        structSize := A_PtrSize + 256
+        buf := Buffer(numPhysical * structSize, 0)
+
+        result := DllCall("dxva2\GetPhysicalMonitorsFromHMONITOR"
+            , "Ptr", hMonitor
+            , "UInt", numPhysical
+            , "Ptr", buf)
+        if !result {
+            return false
         }
-    } catch as err {
-        ; Stats file missing or malformed — start with empty frequency data
-        ToolTip("Note: Word stats reset (file missing or corrupted)")
-        SetTimer(() => ToolTip(), -2000)
-    }
-}
 
-/**
- * Save word frequency statistics to the stats INI file.
- * Prunes entries for words no longer in the word list.
- */
-SaveWordStats() {
-    global wordList, wordFrequency
+        ; Get first physical monitor handle
+        hPhysMon := NumGet(buf, 0, "Ptr")
 
-    ; Remove frequency entries for words no longer in the word list
-    validWords := Map()
-    Loop Parse, wordList, "`n" {
-        if (A_LoopField != "")
-            validWords[A_LoopField] := true
-    }
-    toDelete := []
-    for word in wordFrequency {
-        if !validWords.Has(word)
-            toDelete.Push(word)
-    }
-    for word in toDelete
-        wordFrequency.Delete(word)
+        ; Get current brightness (min, current, max)
+        minBright := 0
+        currBright := 0
+        maxBright := 0
+        result := DllCall("dxva2\GetMonitorBrightness"
+            , "Ptr", hPhysMon
+            , "UInt*", &minBright
+            , "UInt*", &currBright
+            , "UInt*", &maxBright)
 
-    ; Rewrite the stats file from scratch so old keys don't linger
-    try FileDelete(Config.StatsFile)
-    for word, count in wordFrequency
-        IniWrite(count, Config.StatsFile, "Frequency", word)
-}
-
-/**
- * Increment the usage frequency counter for a word
- * @param {String} word The word to increment
- */
-IncrementWordFrequency(word) {
-    global wordFrequency
-
-    if !Config.EnableLearning
-        return
-
-    if wordFrequency.Has(word)
-        wordFrequency[word] := wordFrequency[word] + 1
-    else
-        wordFrequency[word] := 1
-}
-
-/**
- * Get the usage frequency count for a word
- * @param {String} word The word to look up
- * @returns {Integer} The frequency count (0 if never used)
- */
-GetWordFrequency(word) {
-    global wordFrequency
-    return wordFrequency.Has(word) ? wordFrequency[word] : 0
-}
-
-; -----------------------------------------------------------------------------
-; Matching Algorithm
-; -----------------------------------------------------------------------------
-
-/**
- * Find words matching the current input using regex prefix matching
- * and optional typo-tolerant Levenshtein matching.
- * Results are sorted by enhanced score (prefix quality > frequency > length).
- * @param {String} typedWord The currently typed text
- * @param {String} wordListRef The newline-separated word list to search
- * @returns {String} Newline-separated list of matching words, sorted by score
- */
-SuggestWord(typedWord, wordListRef) {
-    if (typedWord = "" || wordListRef = "")
-        return ""
-
-    pattern := typedWord . ".*"
-
-    ; Treat accented characters as equivalent to their unaccented counterparts.
-    ; Patterns are precomputed once as statics to avoid Chr() calls on every keypress.
-    static accentFrom := 0, accentTo := 0
-    if !accentFrom {
-        accentFrom := [
-            "S)[a" . Chr(224) . Chr(226) . "]",
-            "S)[c" . Chr(231) . "]",
-            "S)[e" . Chr(233) . Chr(232) . Chr(234) . Chr(235) . "]",
-            "S)[i" . Chr(238) . Chr(239) . "]",
-            "S)[o" . Chr(244) . "]",
-            "S)[u" . Chr(251) . Chr(249) . "]"
-        ]
-        accentTo := [
-            "[a" . Chr(224) . Chr(226) . "]",
-            "[c" . Chr(231) . "]",
-            "[e" . Chr(233) . Chr(232) . Chr(234) . Chr(235) . "]",
-            "[i" . Chr(238) . Chr(239) . "]",
-            "[o" . Chr(244) . "]",
-            "[u" . Chr(251) . Chr(249) . "]"
-        ]
-    }
-    Loop accentFrom.Length
-        pattern := RegExReplace(pattern, accentFrom[A_Index], accentTo[A_Index])
-
-    pattern := "`nimS)^" . pattern
-
-    ; Search for words matching the regex pattern
-    matchListResult := ""
-    foundWords := Map()
-    pos := 1
-
-    while (matchPos := RegExMatch(wordListRef, pattern, &word, pos)) {
-        pos := matchPos + StrLen(word[0]) + 1
-        wordValue := StrReplace(word[0], A_Tab, "    ")
-        if !foundWords.Has(wordValue) {
-            foundWords[wordValue] := true
-            matchListResult .= wordValue . "`n"
+        if !result {
+            ; Cleanup and signal failure
+            DllCall("dxva2\DestroyPhysicalMonitors", "UInt", numPhysical, "Ptr", buf)
+            return false
         }
+
+        ; Calculate and clamp new brightness
+        newBrightness := Max(minBright, Min(maxBright, currBright + Amount))
+
+        ; Set new brightness
+        DllCall("dxva2\SetMonitorBrightness"
+            , "Ptr", hPhysMon
+            , "UInt", newBrightness)
+
+        ; Show OSD
+        ShowBrightnessOSD(newBrightness, maxBright)
+
+        ; Cleanup physical monitor handles to prevent resource leaks
+        DllCall("dxva2\DestroyPhysicalMonitors", "UInt", numPhysical, "Ptr", buf)
+        return true
+
+    } catch Error as err {
+        return false
     }
-
-    ; Typo-tolerant matching if enabled (first 2 chars must match exactly)
-    if (Config.TypoTolerance > 0 && StrLen(typedWord) >= 3) {
-        prefix2 := StrLower(SubStr(typedWord, 1, 2))
-        Loop Parse, wordListRef, "`n" {
-            wordCandidate := A_LoopField
-            if (wordCandidate = "" || foundWords.Has(wordCandidate))
-                continue
-
-            if (StrLen(wordCandidate) >= 2 && prefix2 = StrLower(SubStr(wordCandidate, 1, 2))) {
-                if (LevenshteinPrefix(StrLower(typedWord), StrLower(wordCandidate)) <= Config.TypoTolerance) {
-                    foundWords[wordCandidate] := true
-                    matchListResult .= wordCandidate . "`n"
-                }
-            }
-        }
-    }
-
-    matchListResult := SubStr(matchListResult, 1, -1) ; Remove trailing delimiter
-
-    ; Sort by enhanced score (descending)
-    sortedMatches := ""
-    Loop Parse, matchListResult, "`n"
-        sortedMatches .= EnhancedScore(typedWord, A_LoopField) . "`t" . A_LoopField . "`n"
-    sortedMatches := SubStr(sortedMatches, 1, -1)
-    sortedMatches := Sort(sortedMatches, "N R")
-    matchListResult := RegExReplace(sortedMatches, "`nmS)^[^`t]+`t") ; Remove scores
-
-    return matchListResult
-}
-
-/**
- * Calculate the Levenshtein (edit) distance between a typed prefix and
- * a candidate word, truncated to the typed length + 2.
- * Used for typo tolerance matching.
- * @param {String} s1 The typed text (lowercase)
- * @param {String} s2 The candidate word (lowercase)
- * @returns {Integer} The edit distance
- */
-LevenshteinPrefix(s1, s2) {
-    len1 := StrLen(s1)
-    len2 := Min(StrLen(s2), len1 + 2)
-    s2 := SubStr(s2, 1, len2)
-
-    if (len1 = 0)
-        return len2
-    if (len2 = 0)
-        return len1
-
-    prev := []
-    Loop len2 + 1
-        prev.Push(A_Index - 1)
-
-    Loop len1 {
-        i := A_Index
-        curr := [i]
-        c1 := SubStr(s1, i, 1)
-        Loop len2 {
-            j := A_Index
-            cost := (c1 = SubStr(s2, j, 1)) ? 0 : 1
-            curr.Push(Min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost))
-        }
-        prev := curr
-    }
-    return prev[len2 + 1]
-}
-
-/**
- * Calculate an enhanced match score combining prefix quality, frequency, and length.
- * Scoring priority: 1) prefix match quality  2) frequency  3) length (mild tiebreaker)
- * @param {String} typedWord The currently typed text
- * @param {String} entry The candidate word
- * @returns {Float} Weighted score (higher = better match)
- */
-EnhancedScore(typedWord, entry) {
-    length := StrLen(typedWord)
-
-    ; How many leading characters match consecutively
-    ; This separates clean prefix matches from typo-tolerance matches
-    pos := 1
-    while (pos <= length && StrLower(SubStr(typedWord, pos, 1)) = StrLower(SubStr(entry, pos, 1)))
-        pos++
-    consecutivePrefix := pos - 1
-    scoreValue := (consecutivePrefix + 1) ** 4
-
-    ; Frequency is the primary tiebreaker among equal-quality prefix matches.
-    ; Linear scaling gives a clear, stable gap (5 uses vs 3 uses = ~35% score difference).
-    freqCount := GetWordFrequency(entry)
-    if (freqCount > 0)
-        scoreValue *= 1.0 + freqCount * 0.5
-
-    ; Mild length preference: shorter completions win when prefix and frequency are equal
-    extraChars := StrLen(entry) - length
-    if (extraChars > 0)
-        scoreValue *= (extraChars + 1) ** -0.1
-
-    return scoreValue
 }
 
 ; -----------------------------------------------------------------------------
-; Word Sending
+; AdjustBrightnessWMI - Control brightness via WMI (laptop displays only)
 ; -----------------------------------------------------------------------------
-
-/**
- * Replace the currently typed text with the completed word.
- * Uses backspace to erase the typed prefix, then sends the new word.
- * Note: StrLen counts UTF-16 code units; this is correct for BMP characters
- * (all Latin/Cyrillic/CJK-A) but would overcount surrogate pairs (emoji).
- * @param {String} typedWord The text the user typed
- * @param {String} newWord The replacement word
- * @param {Boolean} correctCaseEnabled Whether to preserve the user's casing
- */
-SendWord(typedWord, newWord, correctCaseEnabled := false) {
-    if (typedWord = "" || newWord = "")
-        return
-
-    if correctCaseEnabled {
-        pos := 1
-        Loop Parse, typedWord {
-            foundPos := InStr(newWord, A_LoopField, false, pos)
-            if (foundPos > 0) {
-                pos := foundPos
-                if IsUpper(A_LoopField) {
-                    char := SubStr(newWord, pos, 1)
-                    char := StrUpper(char)
-                    newWord := SubStr(newWord, 1, pos - 1) . char . SubStr(newWord, pos + 1)
-                }
-                pos++
-            }
-        }
-    }
-
-    Send("{BS " . StrLen(typedWord) . "}")
-    SendText(newWord)
-}
-
+; Uses WmiMonitorBrightness/WmiMonitorBrightnessMethods for integrated displays.
+; Returns: true if successful, false if no WMI monitor found
 ; -----------------------------------------------------------------------------
-; Exclusion Handling
-; -----------------------------------------------------------------------------
-
-/**
- * Check if the currently active application is in the exclusion list
- * @returns {Boolean} True if autocomplete should be disabled for this app
- */
-IsExcludedApp() {
+AdjustBrightnessWMI(Amount) {
     try {
-        processName := WinGetProcessName("A")
-        Loop Parse, Config.ExcludedApps, "," {
-            if (StrLower(Trim(A_LoopField)) = StrLower(processName))
-                return true
+        wmi := ComObjGet("winmgmts:\\.\root\wmi")
+        currentBrightness := 50
+        found := false
+
+        for monitor in wmi.ExecQuery("SELECT * FROM WmiMonitorBrightness") {
+            currentBrightness := monitor.CurrentBrightness
+            found := true
+            break
         }
+
+        if !found {
+            ToolTip("No brightness-capable monitor found")
+            SetTimer(() => ToolTip(), -3000)
+            return false
+        }
+
+        newBrightness := Max(0, Min(100, currentBrightness + Amount))
+
+        for method in wmi.ExecQuery("SELECT * FROM WmiMonitorBrightnessMethods") {
+            method.WmiSetBrightness(0, newBrightness)
+            break
+        }
+
+        ShowBrightnessOSD(newBrightness, 100)
+        return true
+
+    } catch Error as err {
+        ToolTip("Brightness Failed: " . err.Message)
+        SetTimer(() => ToolTip(), -3000)
+        return false
     }
-    return false
 }
 
 ; -----------------------------------------------------------------------------
-; Utility Functions
+; ShowBrightnessOSD - Display brightness level as tooltip
 ; -----------------------------------------------------------------------------
-
-/**
- * Measure the pixel width of a string using GDI text measurement.
- * Uses Courier New 10pt to match the suggestions popup font.
- * Call with Cleanup=true to release GDI resources (done in ExitHandler).
- * @param {String} str The string to measure
- * @param {Boolean} cleanup If true, release GDI resources and return 0
- * @returns {Integer} The width in pixels
- */
-TextWidth(str, cleanup := false) {
-    static typeFace := "Courier New"
-    static size := 10
-    static hDC := 0, hFont := 0, extent := Buffer(8)
-
-    LOGPIXELSY := 90
-
-    if cleanup {
-        if hFont {
-            DllCall("DeleteObject", "UPtr", hFont)
-            DllCall("ReleaseDC", "UPtr", 0, "UPtr", hDC)
-            hDC := 0
-            hFont := 0
-        }
-        return 0
-    }
-
-    if !hFont {
-        hDC := DllCall("GetDC", "UPtr", 0, "UPtr")
-        height := -DllCall("MulDiv"
-            , "Int", size
-            , "Int", DllCall("GetDeviceCaps", "UPtr", hDC, "Int", LOGPIXELSY)
-            , "Int", 72)
-        hFont := DllCall("CreateFont"
-            , "Int", height, "Int", 0, "Int", 0, "Int", 0, "Int", 400
-            , "UInt", false, "UInt", false, "UInt", false
-            , "UInt", 0, "UInt", 0, "UInt", 0, "UInt", 0, "UInt", 0
-            , "Str", typeFace)
-        DllCall("SelectObject", "UPtr", hDC, "UPtr", hFont, "UPtr")
-    }
-    DllCall("GetTextExtentPoint32", "UPtr", hDC, "Str", str, "Int", StrLen(str), "UPtr", extent.Ptr)
-    return NumGet(extent, 0, "UInt")
-}
-
-/**
- * URL-encode a string (percent-encoding for non-alphanumeric characters)
- * @param {String} text The text to encode
- * @returns {String} The URL-encoded string
- */
-URLEncode(text) {
-    text := StrReplace(text, "%", "%25")
-    foundPos := 0
-    while (foundPos := RegExMatch(text, "S)[^\w\-\.~%]", &char, foundPos + 1)) {
-        text := StrReplace(text, char[0], "%" . Format("{:02X}", Ord(char[0])))
-    }
-    return text
-}
-
-/**
- * URL-decode a percent-encoded string
- * @param {String} encoded The URL-encoded string
- * @returns {String} The decoded string
- */
-URLDecode(encoded) {
-    result := ""
-    pos := 1
-    len := StrLen(encoded)
-    while (pos <= len) {
-        if (SubStr(encoded, pos, 1) = "%" && pos + 2 <= len) {
-            hex := SubStr(encoded, pos + 1, 2)
-            if RegExMatch(hex, "^[0-9A-Fa-f]{2}$") {
-                result .= Chr("0x" . hex)
-                pos += 3
-                continue
-            }
-        }
-        result .= SubStr(encoded, pos, 1)
-        pos++
-    }
-    return result
-}
-
-/**
- * Check if a single character is uppercase
- * @param {String} char A single character
- * @returns {Boolean} True if the character is uppercase
- */
-IsUpper(char) {
-    return char == StrUpper(char) && char != StrLower(char)
-}
-
-/**
- * Atomically write content to a file using a temp-file + move strategy.
- * Prevents data loss if the process is killed mid-write.
- * @param {String} content The content to write
- * @param {String} filePath The target file path
- * @param {String} encoding The file encoding (default: UTF-8-RAW)
- */
-AtomicFileWrite(content, filePath, encoding := "UTF-8-RAW") {
-    tempFile := filePath . ".tmp"
-    try {
-        try FileDelete(tempFile)
-        FileAppend(content, tempFile, encoding)
-        FileMove(tempFile, filePath, true)
-    } catch {
-        try FileDelete(tempFile)
-        ; Fall back to direct write if atomic approach fails
-        try {
-            FileDelete(filePath)
-            FileAppend(content, filePath, encoding)
-        }
-    }
-}
-
-; =============================================================================
-; CLEANUP ON EXIT
-; =============================================================================
-
-/**
- * Save all state on exit: settings, word stats, and word list.
- * If the settings GUI is open, reads current values from its controls.
- * @param {String} exitReason The reason for exit
- * @param {Integer} exitCode The exit code
- */
-ExitHandler(exitReason, exitCode) {
-    global wordList
-
-    ; If settings GUI is open, grab current values from controls
-    if SettingsWindow.instance {
-        try {
-            inst := SettingsWindow.instance
-            Config.MaxResults := Max(1, Min(100, Config.SafeInt(inst.gui["MaxResultsCtrl"].Value, Config.MaxResults)))
-            Config.ShowLength := Max(1, Min(10, Config.SafeInt(inst.gui["ShowLengthCtrl"].Value, Config.ShowLength)))
-            Config.CorrectCase := !!inst.gui["CorrectCaseCtrl"].Value
-            Config.EnableLearning := !!inst.gui["EnableLearningCtrl"].Value
-            Config.TypoTolerance := Max(0, Min(3, Config.SafeInt(inst.gui["TypoToleranceCtrl"].Value, Config.TypoTolerance)))
-            Config.ExcludedApps := inst.gui["ExcludedAppsCtrl"].Value
-        }
-    }
-
-    ; Write settings INI
-    Config.Save()
-
-    ; Save word frequency stats
-    SaveWordStats()
-
-    ; Release GDI resources acquired by TextWidth
-    TextWidth("", true)
-
-    ; Write word list file (atomic)
-    AtomicFileWrite(wordList, Config.WordListFile)
-}
-
-/**
- * Tray menu callback to exit the application
- */
-ExitScript(itemName, itemPos, myMenu) {
-    ExitApp()
+ShowBrightnessOSD(current, max) {
+    percent := max > 0 ? Round((current / max) * 100) : current
+    ToolTip("Brightness: " . percent . "%")
+    SetTimer(() => ToolTip(), -OSD_DISPLAY_TIME)
 }
