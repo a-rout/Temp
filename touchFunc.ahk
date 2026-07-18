@@ -4,12 +4,16 @@
 ; Control system volume and display brightness by touch-dragging along the
 ; extreme edges of the touchscreen.
 ;
-; How to use:
-;   1. Place your finger on the RIGHT edge of the screen (last ~15 pixels)
+; How to use (ONE finger):
+;   1. Place one finger on the RIGHT edge of the screen (last ~40 pixels)
 ;   2. Hold still for a brief moment (~150ms) - a tooltip confirms activation
 ;   3. Drag UP to increase volume, DOWN to decrease
 ;   4. Lift finger to confirm
 ;   Same on LEFT edge → Brightness control
+;
+; Note: Windows converts a touchscreen long-press into a right-click.
+;   This script suppresses that right-click in the edge zone to prevent
+;   the context menu from appearing during gestures.
 ;
 ; Setup:
 ;   For best results, disable Windows edge gestures:
@@ -41,9 +45,9 @@ TraySetIcon("shell32.dll", 168)
 ; =============================================================================
 
 ; Width of the edge detection zone in pixels from each screen edge
-; 15px ≈ 2mm on a typical display — too narrow for accidental hits,
-; wide enough to target deliberately with the bezel as guide
-global EDGE_WIDTH := 15
+; 40px ≈ 5mm on a typical display — easy to hit with one finger,
+; narrow enough that normal scrolling won't reach this zone
+global EDGE_WIDTH := 40
 
 ; Time (ms) to hold still before gesture activates
 ; 150ms feels instant but filters out scrolling (which moves immediately)
@@ -94,6 +98,7 @@ tray.Add("Exit", (*) => (ExitApp(), 0))
 
 #HotIf MouseInEdgeZone() && _gesturesEnabled
 *LButton:: EdgeTouchHandler()
+*RButton:: return  ; Suppress Windows long-press right-click in edge zone
 #HotIf
 
 #InputLevel 0
@@ -396,5 +401,6 @@ ToolTip("Touch Edge Gestures ready"
     . "`nRight edge: 🔊 Volume"
     . "`nLeft edge:  ☀️ Brightness"
     . "`n"
-    . "`nTouch edge → hold briefly → drag ↕")
+    . "`nOne finger: touch edge → hold briefly → drag ↕"
+    . "`nEdge zone: " EDGE_WIDTH "px from each side")
 SetTimer(() => ToolTip(), -4000)
