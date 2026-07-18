@@ -76,6 +76,9 @@ global OSD_TIMEOUT := 1500
 ; Whether edge gestures are currently active
 global _gesturesEnabled := true
 
+; Tracks whether the finger is currently holding the touchscreen/mouse down
+global gIsTouchDown := false
+
 ; =============================================================================
 ; TRAY MENU
 ; =============================================================================
@@ -97,9 +100,19 @@ tray.Add("Exit", (*) => (ExitApp(), 0))
 #InputLevel 1
 
 #HotIf MouseInEdgeZone() && _gesturesEnabled
-*LButton:: EdgeTouchHandler()
+*LButton:: {
+    global gIsTouchDown
+    gIsTouchDown := true
+    EdgeTouchHandler()
+}
 *RButton:: return  ; Suppress Windows long-press right-click in edge zone
 #HotIf
+
+; Reset touch state globally when finger lifts
+~*LButton Up:: {
+    global gIsTouchDown
+    gIsTouchDown := false
+}
 
 #InputLevel 0
 
@@ -145,7 +158,7 @@ EdgeTouchHandler() {
     ; Wait for the user to hold still for HOLD_TIME_MS.
     ; Normal scrolling starts moving immediately — this filters it out.
     activated := false
-    while GetKeyState("LButton", "P") {
+    while gIsTouchDown {
         elapsed := A_TickCount - startTick
         MouseGetPos(&cx, &cy)
         moved := (Abs(cy - startY) > HOLD_MOVE_THRESHOLD
@@ -188,7 +201,7 @@ EdgeTouchHandler() {
     ToolTip(emoji " " label ": " baseLevel "% — drag ↕")
 
     ; Track vertical movement until finger lifts
-    while GetKeyState("LButton", "P") {
+    while gIsTouchDown {
         MouseGetPos(, &nowY)
 
         ; Calculate delta: UP (negative Y) = INCREASE
@@ -243,7 +256,7 @@ EdgeTouchHandler() {
  * @param {Integer} y - Original touch Y position (screen coordinates)
  */
 PassThroughTouch(x, y) {
-    if GetKeyState("LButton", "P") {
+    if gIsTouchDown {
         ; Finger still held — it's a drag/scroll starting from the edge
         ; Send the suppressed LButton Down so the app can handle the drag
         SendInput("{LButton Down}")
@@ -287,6 +300,8 @@ GetCurrentBrightness() {
         for monitor in wmi.ExecQuery("SELECT * FROM WmiMonitorBrightness") {
             return monitor.CurrentBrightness
         }
+    } catch {
+        ; Ignore and fall back to DDC/CI
     }
 
     ; Try DDC/CI (external monitors via Dxva2.dll)
@@ -316,6 +331,8 @@ GetCurrentBrightness() {
 
         DllCall("dxva2\DestroyPhysicalMonitors", "UInt", numPhysical, "Ptr", buf)
         return maxB > 0 ? Round((currB / maxB) * 100) : currB
+    } catch {
+        ; Ignore and return default
     }
 
     return 50  ; Default fallback if both methods fail
@@ -336,6 +353,8 @@ SetBrightnessLevel(level) {
             method.WmiSetBrightness(0, level)
             return
         }
+    } catch {
+        ; Ignore and fall back to DDC/CI
     }
 
     ; Try DDC/CI (external monitors)
@@ -369,6 +388,8 @@ SetBrightnessLevel(level) {
             , "Ptr", hPhysMon, "UInt", actualLevel)
 
         DllCall("dxva2\DestroyPhysicalMonitors", "UInt", numPhysical, "Ptr", buf)
+    } catch {
+        ; Ignore
     }
 }
 
