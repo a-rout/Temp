@@ -1,0 +1,209 @@
+; =============================================================================
+; Taskbar Scroll Controls - Taskbar Scroll Volume & Brightness Control
+; =============================================================================
+; Adjust system volume and screen brightness by scrolling your mouse wheel
+; or trackpad scroll over the Windows taskbar.
+;
+; Features:
+;   - Scroll wheel over taskbar: 🔊 Adjust Volume
+;   - Shift + Scroll wheel over taskbar: ☀️ Adjust Brightness (Laptop & External Monitors)
+;   - Middle-click over taskbar: ⏯️ Play / Pause media
+;   - Side mouse buttons over taskbar: ⏭️/⏮️ Next / Previous track
+;   - Dynamic OSD visual progress bar for both brightness and volume adjustments
+;
+; Hotkeys (Only active when mouse is over taskbar):
+;   WheelUp            Increase volume by 2%
+;   WheelDown          Decrease volume by 2%
+;   Shift + WheelUp    Increase brightness by 5%
+;   Shift + WheelDown  Decrease brightness by 5%
+;   MButton            Play / Pause media
+;   XButton2           Next track
+;   XButton1           Previous track
+; =============================================================================
+
+#Requires AutoHotkey v2.0
+#SingleInstance Force
+
+Persistent
+SendMode "Input"
+CoordMode "Mouse", "Screen"
+
+; Set tray icon (speaker/brightness hybrid lookup)
+TraySetIcon("shell32.dll", 124)
+
+; =============================================================================
+; CONFIGURATION
+; =============================================================================
+
+global VOLUME_STEP := 2            ; Volume change percentage per scroll tick
+global BRIGHTNESS_STEP := 5        ; Brightness change percentage per scroll tick
+global OSD_TIMEOUT := 1500         ; OSD tooltip display duration in ms
+
+; =============================================================================
+; CONSTANTS
+; =============================================================================
+
+global TASKBAR_CLASS := "ahk_class Shell_TrayWnd"
+
+; =============================================================================
+; TRAY MENU
+; =============================================================================
+
+A_IconTip := "Taskbar Scroll Controls"
+
+tray := A_TrayMenu
+tray.Delete()
+tray.Add("Reload", (*) => (Reload(), 0))
+tray.Add("Exit", (*) => (ExitApp(), 0))
+
+; =============================================================================
+; HOTKEYS - Taskbar Mouse Interaction
+; =============================================================================
+
+#HotIf MouseIsOver(TASKBAR_CLASS)
+
+; --- Volume Adjustment (Normal Scroll) ---
+WheelUp:: Send "{Volume_Up " . VOLUME_STEP . "}"
+WheelDown:: Send "{Volume_Down " . VOLUME_STEP . "}"
+
+; --- Brightness Adjustment (Shift + Scroll) ---
++WheelUp:: AdjustBrightness(BRIGHTNESS_STEP)
++WheelDown:: AdjustBrightness(-BRIGHTNESS_STEP)
+
+; --- Media Controls ---
+MButton:: Send "{Media_Play_Pause}"
+XButton2:: Send "{Media_Next}"
+XButton1:: Send "{Media_Prev}"
+
+#HotIf
+
+; =============================================================================
+; MAIN FUNCTIONS
+; =============================================================================
+
+AdjustBrightness(Amount) {
+    ; Try DDC/CI first (works for external monitors)
+    if AdjustBrightnessDDC(Amount)
+        return
+
+    ; Fall back to WMI (works for laptop internal displays)
+    AdjustBrightnessWMI(Amount)
+}
+
+AdjustBrightnessDDC(Amount) {
+    try {
+        ; Get the primary monitor handle (point 0,0 = primary display)
+        ; MONITOR_DEFAULTTOPRIMARY = 1
+        hMonitor := DllCall("user32\MonitorFromPoint", "Int64", 0, "UInt", 1, "Ptr")
+        if !hMonitor
+            return false
+
+        ; Get number of physical monitors
+        numPhysical := 0
+        result := DllCall("dxva2\GetNumberOfPhysicalMonitorsFromHMONITOR"
+            , "Ptr", hMonitor
+            , "UInt*", &numPhysical)
+        if !result || !numPhysical
+            return false
+
+        ; PHYSICAL_MONITOR struct: Ptr handle + 128 WCHAR description
+        structSize := A_PtrSize + 256
+        buf := Buffer(numPhysical * structSize, 0)
+
+        result := DllCall("dxva2\GetPhysicalMonitorsFromHMONITOR"
+            , "Ptr", hMonitor
+            , "UInt", numPhysical
+            , "Ptr", buf)
+        if !result {
+            return false
+        }
+
+        ; Get first physical monitor handle
+        hPhysMon := NumGet(buf, 0, "Ptr")
+
+        ; Get current brightness (min, current, max)
+        minBright := 0
+        currBright := 0
+        maxBright := 0
+        result := DllCall("dxva2\GetMonitorBrightness"
+            , "Ptr", hPhysMon
+            , "UInt*", &minBright
+            , "UInt*", &currBright
+            , "UInt*", &maxBright)
+
+        if !result {
+            ; Cleanup and signal failure
+            DllCall("dxva2\DestroyPhysicalMonitors", "UInt", numPhysical, "Ptr", buf)
+            return false
+        }
+
+        ; Calculate and clamp new brightness
+        newBrightness := Max(minBright, Min(maxBright, currBright + Amount))
+
+        ; Set new brightness
+        DllCall("dxva2\SetMonitorBrightness"
+            , "Ptr", hPhysMon
+            , "UInt", newBrightness)
+
+        ; Show OSD
+        ShowBrightnessOSD(newBrightness, maxBright)
+
+        ; Cleanup physical monitor handles to prevent resource leaks
+        DllCall("dxva2\DestroyPhysicalMonitors", "UInt", numPhysical, "Ptr", buf)
+        return true
+
+    } catch Error as err {
+        return false
+    }
+}
+
+AdjustBrightnessWMI(Amount) {
+    try {
+        wmi := ComObjGet("winmgmts:\\.\root\wmi")
+        currentBrightness := 50
+        found := false
+
+        for monitor in wmi.ExecQuery("SELECT * FROM WmiMonitorBrightness") {
+            currentBrightness := monitor.CurrentBrightness
+            found := true
+            break
+        }
+
+        if !found {
+            ToolTip("No brightness-capable monitor found")
+            SetTimer(() => ToolTip(), -3000)
+            return false
+        }
+
+        newBrightness := Max(0, Min(100, currentBrightness + Amount))
+
+        for method in wmi.ExecQuery("SELECT * FROM WmiMonitorBrightnessMethods") {
+            method.WmiSetBrightness(0, newBrightness)
+            break
+        }
+
+        ShowBrightnessOSD(newBrightness, 100)
+        return true
+
+    } catch Error as err {
+        ToolTip("Brightness Failed: " . err.Message)
+        SetTimer(() => ToolTip(), -3000)
+        return false
+    }
+}
+
+ShowBrightnessOSD(current, max) {
+    percent := max > 0 ? Round((current / max) * 100) : current
+    ToolTip("Brightness: " . percent . "%")
+    SetTimer(() => ToolTip(), -OSD_TIMEOUT)
+}
+
+/**
+ * Checks whether the mouse cursor is currently over a specific window class.
+ * @param {String} winTitle - Window title/class to match
+ * @returns {Integer} Window handle if hovering over matching target, else 0
+ */
+MouseIsOver(winTitle) {
+    MouseGetPos , , &hwnd
+    return WinExist(winTitle " ahk_id " hwnd)
+}
